@@ -1,0 +1,182 @@
+package scanner
+
+// ScanResult contains the outcome of scanning a media folder.
+type ScanResult struct {
+	New                int
+	Updated            int
+	Unchanged          int
+	Missing            int
+	FilesDeleted       int
+	MembershipsRemoved int
+	ItemsDeleted       int
+	Errors             int
+	EmptyRootGuarded   bool
+	// MissingSkippedProtected counts files the scan did not find on disk but
+	// left alone because they sit under an unreachable or suspect-empty root.
+	// A non-zero value means the library is partly offline, not partly gone.
+	MissingSkippedProtected int
+	// UnreachableRoots lists configured library roots that failed the
+	// reachability probe at scan start. Files under them are left untouched:
+	// not marked missing, not trashed, and not purged. A root that does not
+	// answer tells us nothing about whether its files still exist, and
+	// marking them missing would hide working titles from every catalog read
+	// until the next successful scan.
+	UnreachableRoots []string
+	// SuspectEmptyRoots lists roots that probed reachable but were literally
+	// empty directories while the library still holds cataloged files under
+	// them — the signature of a lost mount exposing its bare mountpoint
+	// directory. They receive the same exemptions as UnreachableRoots until
+	// the operator confirms cleanup or the files return.
+	SuspectEmptyRoots []string
+	RootObservations  []RootObservation
+}
+
+// FileHints contains the OSHash gathered during scanning.
+type FileHints struct {
+	FileHash string // OSHash from xattr or computed
+}
+
+// ProbeData contains media file technical information from ffprobe.
+type ProbeData struct {
+	CodecVideo     string
+	CodecAudio     string
+	Resolution     string // 1080p, 2160p, etc.
+	AudioChannels  int
+	HDR            bool
+	Container      string
+	Duration       int // seconds
+	Bitrate        int // kbps
+	VideoTracks    []VideoTrackInfo
+	AudioTracks    []AudioTrackInfo
+	SubtitleTracks []SubtitleTrackInfo
+	Chapters       []ChapterInfo
+	FormatTags     map[string]string // format-level tags from ffprobe (title, artist, album, date, etc.)
+}
+
+// VideoTrackInfo describes a probed video track.
+type VideoTrackInfo struct {
+	Title              string
+	Codec              string
+	DolbyVision        string
+	DVProfile          int
+	DVBLCompatID       int
+	DVELPresent        bool
+	DVEnhancementLayer string
+	HDR10Plus          bool
+	Profile            string
+	Level              int
+	Width              int
+	Height             int
+	AspectRatio        string
+	Interlaced         bool
+	FrameRate          string
+	Bitrate            int
+	VideoRange         string
+	VideoRangeType     string
+	ColorRange         string
+	ColorPrimaries     string
+	ColorSpace         string
+	ColorTransfer      string
+	BitDepth           int
+	PixelFormat        string
+	ReferenceFrames    int
+}
+
+// AudioTrackInfo describes a probed audio track.
+type AudioTrackInfo struct {
+	Title         string
+	EmbeddedTitle string
+	Language      string
+	Codec         string
+	Profile       string
+	Layout        string
+	Channels      int
+	Bitrate       int
+	SampleRate    int
+	BitDepth      int
+	Default       bool
+}
+
+// SubtitleTrackInfo describes an embedded subtitle track from probing.
+type SubtitleTrackInfo struct {
+	Index           int
+	Language        string
+	Codec           string
+	Title           string
+	EmbeddedTitle   string
+	Resolution      string
+	Forced          bool
+	Default         bool
+	HearingImpaired bool
+}
+
+// ExternalSubtitleInfo describes a discovered sidecar subtitle file.
+type ExternalSubtitleInfo struct {
+	Path     string
+	Language string
+	Format   string // srt, vtt, ass, ssa, sub
+	Title    string
+	Forced   bool
+}
+
+// ChapterInfo describes an embedded chapter extracted from ffprobe.
+type ChapterInfo struct {
+	Index        int
+	Title        string
+	StartSeconds float64
+	EndSeconds   float64
+	Source       string
+}
+
+// IntroCreditsMarkers contains intro/credits timing from S3 markers.
+type IntroCreditsMarkers struct {
+	IntroStart   *float64
+	IntroEnd     *float64
+	CreditsStart *float64
+	CreditsEnd   *float64
+}
+
+// MarkerUpdate is the narrow marker-only update payload shared by scanner and analyzers.
+type MarkerUpdate struct {
+	IntroStart        *float64
+	IntroEnd          *float64
+	CreditsStart      *float64
+	CreditsEnd        *float64
+	RecapStart        *float64
+	RecapEnd          *float64
+	PreviewStart      *float64
+	PreviewEnd        *float64
+	MarkersSource     string
+	MarkersProvider   *string
+	MarkersConfidence *float64
+	MarkersAlgorithm  string
+
+	// Optional per-segment provenance overrides. When set for a segment,
+	// UpsertMarkers writes these source/provider/confidence/algorithm values
+	// for that segment instead of the shared Markers* fields above. Used by
+	// merged multi-provider results where each segment may come from a
+	// different provider/source class; left nil for single-source writes
+	// (scanner/s3/local).
+	IntroProvenance   *SegmentProvenance
+	CreditsProvenance *SegmentProvenance
+	RecapProvenance   *SegmentProvenance
+	PreviewProvenance *SegmentProvenance
+}
+
+// SegmentProvenance is a per-segment attribution override for MarkerUpdate.
+// When Source is empty, the shared MarkerUpdate.MarkersSource applies.
+type SegmentProvenance struct {
+	Source     string
+	Provider   *string
+	Confidence *float64
+	Algorithm  string
+}
+
+// HasAnySegment reports whether the update would write at least one segment.
+// An update with no segment bounds set is a no-op and skipped by UpsertMarkers.
+func (u MarkerUpdate) HasAnySegment() bool {
+	return u.IntroStart != nil || u.IntroEnd != nil ||
+		u.CreditsStart != nil || u.CreditsEnd != nil ||
+		u.RecapStart != nil || u.RecapEnd != nil ||
+		u.PreviewStart != nil || u.PreviewEnd != nil
+}

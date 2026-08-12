@@ -1,0 +1,144 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg18
+    restart: unless-stopped
+    shm_size: ${POSTGRES_SHM_SIZE:-8gb}
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-vondel}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-vondel}
+      POSTGRES_DB: ${POSTGRES_DB:-vondel}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - ${VONDEL_DATA_ROOT:-/opt/vondel}/postgres:/var/lib/postgresql
+    command: ["postgres", "-c", "listen_addresses=*"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-vondel}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - ${VONDEL_DATA_ROOT:-/opt/vondel}/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  meilisearch:
+    image: ${MEILISEARCH_IMAGE:-getmeili/meilisearch:latest}
+    restart: unless-stopped
+    profiles: [search]
+    entrypoint:
+      - /bin/sh
+      - -euc
+      - |
+        if [ -z "$${MEILI_MASTER_KEY:-}" ]; then
+          echo "MEILI_MASTER_KEY is required when enabling the search profile" >&2
+          exit 1
+        fi
+        exec /bin/meilisearch
+    environment:
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-}
+    ports:
+      - "${MEILISEARCH_HOST:-127.0.0.1}:${MEILISEARCH_PORT:-7700}:7700"
+    volumes:
+      - ${VONDEL_DATA_ROOT:-/opt/vondel}/meilisearch:/meili_data
+
+  vondel:
+    image: ${VONDEL_IMAGE:-ghcr.io/vondel-media/vondel-server:latest}
+    restart: unless-stopped
+    environment:
+      MODE: integrated
+      # Keep the container listeners fixed. PORT and JF_PORT in .env are
+      # host-side published-port overrides.
+      PORT: "8080"
+      JF_PORT: "8096"
+      # Master key for at-rest credential encryption. Required — the server
+      # refuses to start without it. Generate with: openssl rand -base64 48
+      # Back it up SEPARATELY from your database dumps; losing it makes encrypted
+      # secrets unrecoverable. See docs/architecture/secret-encryption.md.
+      SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env — generate one with openssl rand -base64 48}
+      DATABASE_URL: postgres://${POSTGRES_USER:-vondel}:${POSTGRES_PASSWORD:-vondel}@postgres:5432/${POSTGRES_DB:-vondel}?sslmode=disable
+      REDIS_URL: redis://redis:6379
+      SILO_PLUGIN_CACHE_DIR: /var/lib/silo/plugins
+      POSTGRES_TUNE: ${POSTGRES_TUNE:-auto}
+    ports:
+      - "${PORT:-8090}:8080"
+      - "${JF_PORT:-8096}:8096"
+      - "${ABS_PORT:-13378}:13378"
+    volumes:
+      - ${MEDIA_ROOT:?Set MEDIA_ROOT in .env to the host media path}:${MEDIA_CONTAINER_ROOT:-/mnt/media}:ro
+      - ${VONDEL_DATA_ROOT:-/opt/vondel}/plugins:/var/lib/silo/plugins
+      - ${VONDEL_DATA_ROOT:-/opt/vondel}/compat:/var/lib/silo/compat
+      - ${VONDEL_DATA_ROOT:-/opt/vondel}/transcode:/tmp/silo-transcode
+      - ${VONDEL_DATA_ROOT:-/opt/vondel}/catalog-seeds:/catalog-seeds:ro
+      - /proc/meminfo:/host/proc/meminfo:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
+  # Optional distributed-mode example. Most single-host installs should
+  # just use the integrated service above.
+  # vondel-proxy:
+  #   image: ${VONDEL_IMAGE:-ghcr.io/vondel-media/vondel-server:latest}
+  #   restart: unless-stopped
+  #   profiles: [proxy]
+  #   environment:
+  #     MODE: proxy
+  #     # Must be the SAME SECRET_KEY as the primary node (shared encrypted data).
+  #     SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env — generate one with openssl rand -base64 48}
+  #     DATABASE_URL: postgres://${POSTGRES_USER:-vondel}:${POSTGRES_PASSWORD:-vondel}@postgres:5432/${POSTGRES_DB:-vondel}?sslmode=disable
+  #     REDIS_URL: redis://redis:6379
+  #     PORT: "8080"
+  #   ports:
+  #     - "${PROXY_PORT:-8083}:8080"
+  #   volumes:
+  #     - ${MEDIA_ROOT:?Set MEDIA_ROOT in .env to the host media path}:${MEDIA_CONTAINER_ROOT:-/mnt/media}:ro
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+  #   env_file:
+  #     - path: .env
+  #       required: false
+
+  # Optional distributed-mode example. Most single-host installs should
+  # just use the integrated service above.
+  # vondel-transcode:
+  #   image: ${VONDEL_IMAGE:-ghcr.io/vondel-media/vondel-server:latest}
+  #   restart: unless-stopped
+  #   profiles: [transcode]
+  #   environment:
+  #     MODE: transcode
+  #     # Must be the SAME SECRET_KEY as the primary node (shared encrypted data).
+  #     SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env — generate one with openssl rand -base64 48}
+  #     DATABASE_URL: postgres://${POSTGRES_USER:-vondel}:${POSTGRES_PASSWORD:-vondel}@postgres:5432/${POSTGRES_DB:-vondel}?sslmode=disable
+  #     REDIS_URL: redis://redis:6379
+  #     SILO_PLUGIN_CACHE_DIR: /var/lib/silo/plugins
+  #     PORT: "8080"
+  #   ports:
+  #     - "${TRANSCODE_PORT:-8082}:8080"
+  #   volumes:
+  #     - ${MEDIA_ROOT:?Set MEDIA_ROOT in .env to the host media path}:${MEDIA_CONTAINER_ROOT:-/mnt/media}:ro
+  #     - ${VONDEL_DATA_ROOT:-/opt/vondel}/plugins:/var/lib/silo/plugins
+  #     - ${VONDEL_DATA_ROOT:-/opt/vondel}/transcode:/tmp/silo-transcode
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+  #   env_file:
+  #     - path: .env
+  #       required: false

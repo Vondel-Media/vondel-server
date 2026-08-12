@@ -1,0 +1,326 @@
+import { useImageLoaded } from "@/hooks/useImageLoaded";
+import { Check, Layers } from "lucide-react";
+import ViewTransitionLink from "@/components/ViewTransitionLink";
+import type { BrowseItem } from "@/api/types";
+import { decodeThumbhash } from "@/lib/thumbhash";
+import { timeAgo } from "@/lib/timeAgo";
+import MediaItemMenu from "@/components/MediaItemMenu";
+import CardOverlays from "@/components/overlays/CardOverlays";
+import { overlayDataFromBrowseItem, type CardOverlayPrefs } from "@/lib/overlays";
+import { buildEpisodeCardLabels } from "@/lib/episodeCardLabels";
+import { formatDate as formatPreferredDate } from "@/lib/datetime";
+import { formatBitrate } from "@/lib/mediaFormat";
+import { useUICustomization } from "@/hooks/useUICustomization";
+
+const DATE_ONLY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+function formatDate(value?: string | null) {
+  if (!value) {
+    return null;
+  }
+  const date = new Date(DATE_ONLY_PATTERN.test(value) ? `${value}T00:00:00` : value);
+  return formatPreferredDate(date, "medium") || null;
+}
+
+function formatRuntime(minutes?: number | null) {
+  if (!minutes || minutes <= 0) {
+    return null;
+  }
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  if (hours === 0) {
+    return `${remainingMinutes}m`;
+  }
+  return remainingMinutes === 0 ? `${hours}h` : `${hours}h ${remainingMinutes}m`;
+}
+
+function formatRating(value?: number | null, max = 10) {
+  return value != null ? `${value.toFixed(1)} / ${max}` : null;
+}
+
+function formatPercent(value?: number | null) {
+  return value != null ? `${value}%` : null;
+}
+
+function formatProgress(ratio?: number | null) {
+  if (ratio == null) {
+    return null;
+  }
+  return `${Math.round(Math.max(0, Math.min(1, ratio)) * 100)}%`;
+}
+
+// mangaCountChipLabel returns the top-right poster chip label for a manga
+// browse item, or null when the item is not manga or has no counts. The server
+// sends distinct volumes (manga_volume_count) and loose un-volumed chapters
+// (manga_chapter_count) separately. Labels are abbreviated ("12 Vol · 3 Ch")
+// so the chip fits narrow cards without occluding the cover; the detail page
+// carries the spelled-out counts. Strictly manga-gated so no other card type
+// renders it.
+function mangaCountChipLabel(item: BrowseItem): string | null {
+  if (item.type !== "manga") {
+    return null;
+  }
+  const volumes = item.manga_volume_count ?? 0;
+  const chapters = item.manga_chapter_count ?? 0;
+  const parts: string[] = [];
+  if (volumes > 0) {
+    parts.push(`${volumes} Vol`);
+  }
+  if (chapters > 0) {
+    parts.push(`${chapters} Ch`);
+  }
+  return parts.length > 0 ? parts.join(" · ") : null;
+}
+
+// mangaStatusChip returns the top-left publication-status pill for a manga
+// browse card (color-coded), or null when the item is not manga or has no
+// status. Strictly manga-gated so no other card type renders it.
+function mangaStatusChip(item: BrowseItem): { label: string; tone: string } | null {
+  if (item.type !== "manga") {
+    return null;
+  }
+  const status = item.show_status?.trim();
+  if (!status) {
+    return null;
+  }
+  const tone =
+    {
+      Ongoing: "text-emerald-200 border-emerald-400/30",
+      Completed: "text-sky-200 border-sky-400/30",
+      Hiatus: "text-amber-200 border-amber-400/30",
+      Cancelled: "text-red-300 border-red-400/30",
+      Upcoming: "text-violet-200 border-violet-400/30",
+    }[status] ?? "text-foreground border-white/15";
+  return { label: status, tone };
+}
+
+function SortMeta({ item, sortField }: { item: BrowseItem; sortField?: string }) {
+  const episodeLabels = buildEpisodeCardLabels(item);
+  const defaultLabel = [item.year || "", item.type === "series" ? "Series" : ""]
+    .filter(Boolean)
+    .join(" · ");
+
+  switch (sortField) {
+    case "added_at":
+    case "recently_added": {
+      const ago = item.added_at ? timeAgo(item.added_at) : null;
+      return <>{ago ?? defaultLabel}</>;
+    }
+    case "title":
+      if (episodeLabels) {
+        return <>{episodeLabels.episodeCode}</>;
+      }
+      return <>{defaultLabel}</>;
+    case "year":
+      return <>{item.year || defaultLabel}</>;
+    case "content_rating":
+      return <>{item.content_rating || defaultLabel}</>;
+    case "runtime":
+      return (
+        <>{formatRuntime(item.sort_metrics?.runtime_minutes ?? item.runtime) ?? defaultLabel}</>
+      );
+    case "rating_imdb":
+      return item.rating_imdb != null ? (
+        <>
+          <span className="not-uppercase">★</span> {item.rating_imdb.toFixed(1)} / 10
+        </>
+      ) : (
+        <>{defaultLabel}</>
+      );
+    case "rating_tmdb":
+      return <>{formatRating(item.rating_tmdb) ?? defaultLabel}</>;
+    case "rating_rt_critic":
+      return <>{formatPercent(item.rating_rt_critic) ?? defaultLabel}</>;
+    case "rating_rt_audience":
+      return <>{formatPercent(item.rating_rt_audience) ?? defaultLabel}</>;
+    case "release_date":
+      return (
+        <>{formatDate(item.sort_metrics?.release_date ?? item.release_date) ?? defaultLabel}</>
+      );
+    case "last_air_date":
+      return <>{formatDate(item.last_air_date) ?? defaultLabel}</>;
+    case "resolution":
+      return (
+        <>{item.sort_metrics?.resolution || item.overlay_summary?.resolution || defaultLabel}</>
+      );
+    case "bitrate":
+      return <>{formatBitrate(item.sort_metrics?.bitrate_kbps ?? undefined) || defaultLabel}</>;
+    case "progress":
+      return <>{formatProgress(item.sort_metrics?.progress_ratio) ?? defaultLabel}</>;
+    case "date_viewed":
+      return <>{formatDate(item.sort_metrics?.viewed_at) ?? defaultLabel}</>;
+    case "plays":
+      return <>{item.sort_metrics?.play_count ?? defaultLabel}</>;
+    case "author":
+      return <>{item.sort_metrics?.author || defaultLabel}</>;
+    case "narrator":
+      return <>{item.sort_metrics?.narrator || defaultLabel}</>;
+    case "series":
+      return <>{item.sort_metrics?.series_name || defaultLabel}</>;
+    default:
+      if (episodeLabels) {
+        return <>{episodeLabels.episodeCode}</>;
+      }
+      return <>{defaultLabel}</>;
+  }
+}
+
+export default function ItemCard({
+  item,
+  libraryId,
+  sortField,
+  overlayPrefs,
+  selectionMode = false,
+  selected = false,
+  onToggleSelect,
+}: {
+  item: BrowseItem;
+  libraryId?: number;
+  sortField?: string;
+  overlayPrefs?: CardOverlayPrefs | null;
+  selectionMode?: boolean;
+  selected?: boolean;
+  onToggleSelect?: (item: BrowseItem) => void;
+}) {
+  const { loaded, onLoad } = useImageLoaded(item.poster_url);
+  const thumbhashUrl = item.poster_thumbhash ? decodeThumbhash(item.poster_thumbhash) : "";
+  const itemHref = `/item/${encodeURIComponent(item.content_id)}${
+    libraryId ? `?libraryId=${libraryId}` : ""
+  }`;
+  const episodeLabels = buildEpisodeCardLabels(item);
+  const displayTitle = episodeLabels ? episodeLabels.seriesTitle : item.title;
+  const mangaCountLabel = mangaCountChipLabel(item);
+  const mangaStatus = mangaStatusChip(item);
+  const { cardPresentation } = useUICustomization();
+  const showCaption = cardPresentation.caption !== "artwork";
+  const showMetadata = cardPresentation.caption === "title_metadata";
+
+  return (
+    <div className="media-card group/card">
+      <div className="relative">
+        <ViewTransitionLink
+          to={itemHref}
+          aria-label={displayTitle}
+          className="block overflow-hidden rounded-xl"
+        >
+          <div
+            className={`media-card-image relative ${
+              item.type === "audiobook" ? "aspect-square" : "aspect-[2/3]"
+            }`}
+            style={
+              thumbhashUrl
+                ? {
+                    backgroundImage: `url(${thumbhashUrl})`,
+                    backgroundSize: "cover",
+                    backgroundPosition: "center",
+                  }
+                : undefined
+            }
+          >
+            {item.poster_url ? (
+              <img
+                src={item.poster_url}
+                alt={displayTitle}
+                className={`h-full w-full object-cover transition-opacity duration-300 ${loaded ? "opacity-100" : "opacity-0"}`}
+                onLoad={onLoad}
+              />
+            ) : (
+              <div className="text-muted-foreground flex h-full w-full flex-col items-center justify-center gap-1 p-3 text-center text-sm">
+                <span className="line-clamp-3 font-medium">{displayTitle || "No Poster"}</span>
+              </div>
+            )}
+            <div className="from-background/70 pointer-events-none absolute inset-x-0 bottom-0 h-24 bg-gradient-to-t to-transparent opacity-90" />
+            {item.status === "pending" && (
+              <span className="glass-subtle text-foreground absolute top-2.5 left-2.5 rounded-full border border-white/15 px-2.5 py-1 text-[10px] font-semibold tracking-[0.14em] uppercase">
+                Scanning
+              </span>
+            )}
+            {item.status === "unmatched" && (
+              <span className="glass-subtle absolute top-2.5 left-2.5 rounded-full border border-red-500/25 px-2.5 py-1 text-[10px] font-semibold tracking-[0.14em] text-red-300 uppercase">
+                Unmatched
+              </span>
+            )}
+            {item.status === "ambiguous" && (
+              <span className="glass-subtle absolute top-2.5 left-2.5 rounded-full border border-amber-500/25 px-2.5 py-1 text-[10px] font-semibold tracking-[0.14em] text-amber-200 uppercase">
+                Ambiguous
+              </span>
+            )}
+            {/* Manga cards carry purpose-built status/count chips in both top
+                corners; generic overlays would render underneath them. */}
+            {item.status === "matched" && item.type !== "manga" && overlayPrefs && (
+              <CardOverlays data={overlayDataFromBrowseItem(item)} prefs={overlayPrefs} />
+            )}
+            {(mangaStatus || mangaCountLabel) && (
+              /* One shared row so the two chips split the card width and
+                 truncate instead of overlapping on narrow cards. */
+              <div className="pointer-events-none absolute inset-x-2.5 top-2.5 flex items-start justify-between gap-1.5">
+                {mangaStatus ? (
+                  <span
+                    className={`glass-chip min-w-0 truncate rounded-full border px-2.5 py-1 text-[10px] font-semibold tracking-[0.14em] uppercase ${mangaStatus.tone}`}
+                  >
+                    {mangaStatus.label}
+                  </span>
+                ) : (
+                  <span />
+                )}
+                {mangaCountLabel && (
+                  <span className="glass-chip text-foreground inline-flex min-w-0 items-center gap-1 rounded-full border border-white/15 px-2.5 py-1 text-[10px] font-semibold tracking-[0.14em] uppercase">
+                    <Layers className="size-3 shrink-0" />
+                    <span className="truncate">{mangaCountLabel}</span>
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+        </ViewTransitionLink>
+        {selectionMode && onToggleSelect && (
+          <button
+            type="button"
+            aria-label={selected ? `Deselect ${item.title}` : `Select ${item.title}`}
+            aria-pressed={selected}
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              onToggleSelect(item);
+            }}
+            onPointerDown={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+            }}
+            className="absolute top-2.5 left-2.5 z-20 inline-flex size-8 items-center justify-center rounded-full border border-white/20 bg-black/55 text-white shadow-sm backdrop-blur-sm transition-colors hover:bg-black/70"
+          >
+            <span
+              className={`flex size-4 items-center justify-center rounded-full border ${
+                selected ? "border-primary bg-primary text-primary-foreground" : "border-white/70"
+              }`}
+            >
+              {selected && <Check className="size-3" />}
+            </span>
+          </button>
+        )}
+        <MediaItemMenu
+          contentId={item.content_id}
+          mediaType={item.type}
+          libraryId={libraryId}
+          userState={item.user_state}
+          variant="poster"
+        />
+      </div>
+      {showCaption ? (
+        <ViewTransitionLink to={itemHref} className="block px-1 pt-3">
+          <div className="truncate text-[14px] font-semibold tracking-tight">{displayTitle}</div>
+          {showMetadata && episodeLabels?.episodeTitle ? (
+            <div className="text-muted-foreground mt-1 truncate text-[12px] font-medium">
+              {episodeLabels.episodeTitle}
+            </div>
+          ) : null}
+          {showMetadata ? (
+            <div className="text-muted-foreground mt-1 text-[11px] font-medium tracking-[0.14em] uppercase">
+              <SortMeta item={item} sortField={sortField} />
+            </div>
+          ) : null}
+        </ViewTransitionLink>
+      ) : null}
+    </div>
+  );
+}

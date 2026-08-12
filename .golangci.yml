@@ -1,0 +1,82 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/streamapp/streamapp
+
+linters:
+  enable:
+    - bodyclose
+    - errcheck
+    - errorlint
+    - goconst
+    - govet
+    - ineffassign
+    - misspell
+    - nilerr
+    - sloglint
+    - staticcheck
+    - unconvert
+    - unused
+    - wastedassign
+
+  settings:
+    sloglint:
+      # Require the context-carrying slog variants (InfoContext, …) wherever a
+      # context.Context is in scope, so log records correlate with the active
+      # OpenTelemetry trace. "scope" (not "all") allows the plain Info/… form in
+      # background/init code where no ctx exists. Enforced repo-wide after the
+      # phase-3 sweep converted the ~1,159 legacy call sites.
+      context: "scope"
+      # Message must be a constant, not a built string; move dynamic parts to attrs.
+      static-msg: true
+      # Attribute keys are snake_case (component, request_id, trace_id, …).
+      key-naming-case: snake
+      # Don't mix key-value pairs and slog.Attr in one call.
+      no-mixed-args: true
+
+    errcheck:
+      check-type-assertions: true
+
+    errorlint:
+      errorf: true
+      asserts: true
+      comparison: true
+
+    goconst:
+      min-len: 3
+      min-occurrences: 3
+
+    misspell:
+      locale: US
+
+  exclusions:
+    # Anchored regexes, not directory names: `paths` matches anywhere in the
+    # path, so a bare `web` also excluded internal/jellycompat/web_component.go,
+    # internal/webhooksync/, internal/notifications/webhook*.go and every other
+    # non-test file with "web" in its name — 14 files that were being linted
+    # before.
+    paths:
+      - ^web/
+      - ^migrations/
+
+    rules:
+      # Allow repeated strings in test files
+      - path: _test\.go
+        linters:
+          - goconst
+
+      # Allow unchecked errors in test cleanup/defer
+      - path: _test\.go
+        text: "Error return value is not checked"
+        linters:
+          - errcheck

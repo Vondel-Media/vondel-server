@@ -1,0 +1,20 @@
+services:
+  vondel:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${NVIDIA_GPU_COUNT:-1}
+              capabilities: [gpu]
+
+  # Optional distributed-mode example. Most single-host installs should
+  # just use the integrated service above.
+  #  vondel-transcode:
+  #  deploy:
+  #    resources:
+  #      reservations:
+  #        devices:
+  #          - driver: nvidia
+  #            count: ${NVIDIA_GPU_COUNT:-1}
+  #            capabilities: [gpu]

@@ -1,0 +1,3525 @@
+package watchsync
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+	"github.com/Vondel-Media/vondel-server/internal/historyimport"
+	"github.com/Vondel-Media/vondel-server/internal/userdb"
+	"github.com/Vondel-Media/vondel-server/internal/userstore"
+)
+
+const (
+	testProviderAccountID    = "account-1"
+	testAccessToken          = "access"
+	testBearerTokenType      = "Bearer"
+	testCursorOne            = "cursor-1"
+	testDPoPTokenType        = "DPoP"
+	testHistoryExportID      = "export-1"
+	testHistoryScope         = "history"
+	testMovieMediaID         = "movie-1"
+	testMovieProviderItemKey = "movie:tmdb:603"
+	testOldAccessToken       = "old-access"
+	testOldRefreshToken      = "old-refresh"
+	testOneValue             = "one"
+	testPluginUsername       = "alice"
+	testRefreshToken         = "refresh"
+	testReconnectRequired    = "reconnect required"
+	testRotatedAccessToken   = "rotated-access"
+	testSecretValue          = "secret"
+	testValidatedToken       = "validated-token"
+)
+
+type serviceFakeRepo struct {
+	connections            map[string]Connection
+	dueConnections         []Connection
+	sessions               map[string]DeviceAuthSession
+	settings               map[string]string
+	syncRuns               []SyncRun
+	historyExports         []HistoryExport
+	listItemStates         []ListItemState
+	scrobbleConnections    []Connection
+	scrobbleSessions       []ScrobbleSession
+	pendingReconciliations []ScrobbleSession
+	reconciledScrobbles    map[string]time.Time
+	scrobbleUpdates        []scrobbleUpdate
+	reopenedScrobbles      []scrobbleUpdate
+	confirmedScrobbles     map[string]bool
+	confirmingScrobbles    map[string]time.Time
+	markSatisfiedErr       error
+	markHistoryStatusErr   error
+	syncRunMu              sync.Mutex
+	scrobbleMu             sync.Mutex
+}
+
+type scrobbleUpdate struct {
+	playbackSessionID string
+	connectionID      string
+	action            string
+	positionSeconds   float64
+	historyID         string
+	lastError         string
+	stopSentAt        *time.Time
+}
+
+func newServiceFakeRepo() *serviceFakeRepo {
+	return &serviceFakeRepo{
+		connections:         make(map[string]Connection),
+		sessions:            make(map[string]DeviceAuthSession),
+		confirmedScrobbles:  make(map[string]bool),
+		confirmingScrobbles: make(map[string]time.Time),
+		reconciledScrobbles: make(map[string]time.Time),
+		settings: map[string]string{
+			"watchsync.trakt.client_id":     "client-id",
+			"watchsync.trakt.client_secret": "client-secret",
+			"watchsync.simkl.client_id":     "client-id",
+			"watchsync.simkl.client_secret": "client-secret",
+		},
+	}
+}
+
+func (r *serviceFakeRepo) GetServerSetting(_ context.Context, key string) (string, error) {
+	return r.settings[key], nil
+}
+
+func (r *serviceFakeRepo) UpsertAuthSession(
+	_ context.Context,
+	session DeviceAuthSession,
+) (DeviceAuthSession, error) {
+	if session.ID == "" {
+		session.ID = "auth-1"
+	}
+	r.sessions[session.ID] = session
+	return session, nil
+}
+
+func (r *serviceFakeRepo) GetAuthSession(_ context.Context, id string) (DeviceAuthSession, error) {
+	session, ok := r.sessions[id]
+	if !ok {
+		return DeviceAuthSession{}, errors.New("missing auth session")
+	}
+	return session, nil
+}
+
+func (r *serviceFakeRepo) UpsertConnection(
+	_ context.Context,
+	conn Connection,
+) (Connection, error) {
+	if conn.ID == "" {
+		conn.ID = "conn-1"
+	}
+	conn = cloneConnectionForTest(conn)
+	r.connections[connectionKey(conn.Provider, conn.UserID, conn.ProfileID)] = conn
+	return cloneConnectionForTest(conn), nil
+}
+
+func (r *serviceFakeRepo) GetConnection(
+	_ context.Context,
+	provider string,
+	userID int,
+	profileID string,
+) (Connection, bool, error) {
+	conn, ok := r.connections[connectionKey(provider, userID, profileID)]
+	return cloneConnectionForTest(conn), ok, nil
+}
+
+func (r *serviceFakeRepo) DeferConnectionsForAccount(
+	_ context.Context,
+	provider string,
+	providerAccountID string,
+	until time.Time,
+	lastError string,
+) (int, error) {
+	if providerAccountID == "" {
+		return 0, nil
+	}
+	deferred := 0
+	for key, conn := range r.connections {
+		if conn.Provider != provider || conn.ProviderAccountID != providerAccountID {
+			continue
+		}
+		untilCopy := until
+		conn.RateLimitedUntil = &untilCopy
+		conn.LastError = lastError
+		r.connections[key] = conn
+		deferred++
+	}
+	return deferred, nil
+}
+
+func (r *serviceFakeRepo) GetConnectionByID(_ context.Context, id string) (Connection, bool, error) {
+	for _, conn := range r.connections {
+		if conn.ID == id {
+			return cloneConnectionForTest(conn), true, nil
+		}
+	}
+	for _, conn := range r.scrobbleConnections {
+		if conn.ID == id {
+			return cloneConnectionForTest(conn), true, nil
+		}
+	}
+	return Connection{}, false, nil
+}
+
+func (r *serviceFakeRepo) DeleteConnection(
+	_ context.Context,
+	provider string,
+	userID int,
+	profileID string,
+) error {
+	delete(r.connections, connectionKey(provider, userID, profileID))
+	return nil
+}
+
+func (r *serviceFakeRepo) ListConnectionsDueForSync(
+	_ context.Context,
+	_ time.Time,
+) ([]Connection, error) {
+	out := make([]Connection, 0, len(r.dueConnections))
+	for _, conn := range r.dueConnections {
+		out = append(out, cloneConnectionForTest(conn))
+	}
+	return out, nil
+}
+
+func (r *serviceFakeRepo) CreateSyncRun(_ context.Context, run SyncRun) (SyncRun, error) {
+	r.syncRunMu.Lock()
+	defer r.syncRunMu.Unlock()
+	if run.ID == "" {
+		run.ID = "run-" + strconv.Itoa(len(r.syncRuns)+1)
+	}
+	if run.Status == "" {
+		run.Status = string(SyncRunStatusRunning)
+	}
+	if run.StartedAt.IsZero() {
+		run.StartedAt = time.Now()
+	}
+	if run.CreatedAt.IsZero() {
+		run.CreatedAt = run.StartedAt
+	}
+	r.syncRuns = append(r.syncRuns, run)
+	return run, nil
+}
+
+func (r *serviceFakeRepo) CompleteSyncRun(_ context.Context, run SyncRun) (SyncRun, error) {
+	r.syncRunMu.Lock()
+	defer r.syncRunMu.Unlock()
+	for i := range r.syncRuns {
+		if r.syncRuns[i].ID == run.ID {
+			if run.CreatedAt.IsZero() {
+				run.CreatedAt = r.syncRuns[i].CreatedAt
+			}
+			if run.StartedAt.IsZero() {
+				run.StartedAt = r.syncRuns[i].StartedAt
+			}
+			r.syncRuns[i] = run
+			return run, nil
+		}
+	}
+	return SyncRun{}, errors.New("missing sync run")
+}
+
+func (r *serviceFakeRepo) GetLatestSyncRun(_ context.Context, connectionID string) (SyncRun, bool, error) {
+	r.syncRunMu.Lock()
+	defer r.syncRunMu.Unlock()
+	for i := len(r.syncRuns) - 1; i >= 0; i-- {
+		if r.syncRuns[i].ConnectionID == connectionID {
+			return r.syncRuns[i], true, nil
+		}
+	}
+	return SyncRun{}, false, nil
+}
+
+func (r *serviceFakeRepo) GetActiveSyncRun(_ context.Context, connectionID string) (SyncRun, bool, error) {
+	r.syncRunMu.Lock()
+	defer r.syncRunMu.Unlock()
+	for i := len(r.syncRuns) - 1; i >= 0; i-- {
+		run := r.syncRuns[i]
+		if run.ConnectionID == connectionID &&
+			(run.Status == string(SyncRunStatusQueued) || run.Status == string(SyncRunStatusRunning)) {
+			return run, true, nil
+		}
+	}
+	return SyncRun{}, false, nil
+}
+
+func (r *serviceFakeRepo) ListSyncRuns(_ context.Context, connectionID string, limit int) ([]SyncRun, error) {
+	r.syncRunMu.Lock()
+	defer r.syncRunMu.Unlock()
+	if limit <= 0 || limit > 50 {
+		limit = 10
+	}
+	var runs []SyncRun
+	for i := len(r.syncRuns) - 1; i >= 0 && len(runs) < limit; i-- {
+		if r.syncRuns[i].ConnectionID == connectionID {
+			runs = append(runs, r.syncRuns[i])
+		}
+	}
+	return runs, nil
+}
+
+func (r *serviceFakeRepo) ListLocalWatchEventConnections(_ context.Context, userID int, profileID string, kind LocalWatchEventKind) ([]Connection, error) {
+	var conns []Connection
+	for _, conn := range r.connections {
+		if conn.UserID != userID || conn.ProfileID != profileID {
+			continue
+		}
+		if conn.RateLimitedUntil != nil && conn.RateLimitedUntil.After(time.Now()) {
+			continue
+		}
+		switch kind {
+		case LocalWatchEventMarkedWatched:
+			if conn.ExportWatchedEnabled {
+				conns = append(conns, cloneConnectionForTest(conn))
+			}
+		case LocalWatchEventMarkedUnwatched:
+			if conn.ExportUnwatchedEnabled {
+				conns = append(conns, cloneConnectionForTest(conn))
+			}
+		}
+	}
+	return conns, nil
+}
+
+func (r *serviceFakeRepo) ListListEventConnections(_ context.Context, userID int, profileID string, list ListKind) ([]Connection, error) {
+	var conns []Connection
+	for _, conn := range r.connections {
+		if conn.UserID != userID || conn.ProfileID != profileID {
+			continue
+		}
+		enabled := conn.ExportFavoritesEnabled
+		if list == ListKindWatchlist {
+			enabled = conn.ExportWatchlistEnabled
+		}
+		if enabled {
+			conns = append(conns, cloneConnectionForTest(conn))
+		}
+	}
+	return conns, nil
+}
+
+func (r *serviceFakeRepo) UpsertHistoryExports(_ context.Context, exports []HistoryExport) error {
+	for _, export := range exports {
+		if export.ID == "" {
+			export.ID = "export-" + strconv.Itoa(len(r.historyExports)+1)
+		}
+		replaced := false
+		for i := range r.historyExports {
+			if r.historyExports[i].HistoryID == export.HistoryID && r.historyExports[i].ConnectionID == export.ConnectionID {
+				existing := r.historyExports[i]
+				export.ID = existing.ID
+				export.AttemptCount = existing.AttemptCount
+				if existing.Status == historyExportStatusSent || existing.Status == historyExportStatusSatisfiedByScrobble || existing.Status == historyExportStatusNotFound || existing.AttemptCount >= 5 {
+					export.Status = existing.Status
+				}
+				r.historyExports[i] = export
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			r.historyExports = append(r.historyExports, export)
+		}
+	}
+	return nil
+}
+
+func (r *serviceFakeRepo) ListPendingHistoryExports(_ context.Context, connectionID string, limit int) ([]HistoryExport, error) {
+	var exports []HistoryExport
+	for _, export := range r.historyExports {
+		if export.ConnectionID == connectionID &&
+			(export.Status == historyExportStatusPending || export.Status == historyExportStatusFailed) && export.AttemptCount < 5 {
+			exports = append(exports, export)
+			if limit > 0 && len(exports) >= limit {
+				break
+			}
+		}
+	}
+	return exports, nil
+}
+
+func (r *serviceFakeRepo) MarkHistoryExportStatus(_ context.Context, id string, status string, lastError string) error {
+	if r.markHistoryStatusErr != nil {
+		return r.markHistoryStatusErr
+	}
+	for i := range r.historyExports {
+		if r.historyExports[i].ID == id {
+			if r.historyExports[i].Status == historyExportStatusSent || r.historyExports[i].Status == historyExportStatusSatisfiedByScrobble || r.historyExports[i].Status == historyExportStatusNotFound {
+				return nil
+			}
+			r.historyExports[i].Status = status
+			r.historyExports[i].AttemptCount++
+			r.historyExports[i].LastError = lastError
+			return nil
+		}
+	}
+	return nil
+}
+
+func (r *serviceFakeRepo) MarkHistoryExportSatisfiedByScrobble(_ context.Context, connectionID string, historyID string) error {
+	if r.markSatisfiedErr != nil {
+		return r.markSatisfiedErr
+	}
+	for i := range r.historyExports {
+		if r.historyExports[i].ConnectionID == connectionID && r.historyExports[i].HistoryID == historyID {
+			if r.historyExports[i].Status == historyExportStatusSent || r.historyExports[i].Status == historyExportStatusNotFound {
+				return nil
+			}
+			r.historyExports[i].Status = historyExportStatusSatisfiedByScrobble
+			return nil
+		}
+	}
+	return nil
+}
+
+func (r *serviceFakeRepo) UpsertListItemStates(_ context.Context, states []ListItemState) error {
+	for _, state := range states {
+		if state.ListKind == "" {
+			state.ListKind = ListKindFavorites
+		}
+		replaced := false
+		for i := range r.listItemStates {
+			if r.listItemStates[i].ConnectionID == state.ConnectionID &&
+				r.listItemStates[i].ListKind == state.ListKind &&
+				r.listItemStates[i].MediaItemID == state.MediaItemID {
+				if state.ID == "" {
+					state.ID = r.listItemStates[i].ID
+				}
+				r.listItemStates[i] = state
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			if state.ID == "" {
+				state.ID = "list-item-" + strconv.Itoa(len(r.listItemStates)+1)
+			}
+			r.listItemStates = append(r.listItemStates, state)
+		}
+	}
+	return nil
+}
+
+func (r *serviceFakeRepo) ListListItemStates(_ context.Context, connectionID string, kind ListKind) ([]ListItemState, error) {
+	var states []ListItemState
+	for _, state := range r.listItemStates {
+		if state.ConnectionID == connectionID && state.ListKind == kind {
+			states = append(states, state)
+		}
+	}
+	return states, nil
+}
+
+func (r *serviceFakeRepo) ListPendingListItemExports(_ context.Context, connectionID string, kind ListKind, limit int) ([]ListItemState, error) {
+	var states []ListItemState
+	for _, state := range r.listItemStates {
+		if state.ConnectionID == connectionID && state.ListKind == kind && state.LocalPresent && !state.RemotePresent && state.LastError == "" {
+			states = append(states, state)
+			if limit > 0 && len(states) >= limit {
+				break
+			}
+		}
+	}
+	return states, nil
+}
+
+func (r *serviceFakeRepo) ListPendingListItemRemovals(_ context.Context, connectionID string, kind ListKind, limit int) ([]ListItemState, error) {
+	var states []ListItemState
+	for _, state := range r.listItemStates {
+		if state.ConnectionID == connectionID && state.ListKind == kind && !state.LocalPresent && state.RemotePresent && state.LastError == "" {
+			states = append(states, state)
+			if limit > 0 && len(states) >= limit {
+				break
+			}
+		}
+	}
+	return states, nil
+}
+
+func (r *serviceFakeRepo) markListItem(connectionID string, kind ListKind, mediaItemID string, apply func(*ListItemState)) {
+	for i := range r.listItemStates {
+		if r.listItemStates[i].ConnectionID == connectionID && r.listItemStates[i].ListKind == kind && r.listItemStates[i].MediaItemID == mediaItemID {
+			apply(&r.listItemStates[i])
+		}
+	}
+}
+
+func (r *serviceFakeRepo) MarkListItemExported(_ context.Context, connectionID string, kind ListKind, mediaItemID string, exportedAt time.Time) error {
+	// Mirror Postgres: successful transitions clear last_error.
+	r.markListItem(connectionID, kind, mediaItemID, func(s *ListItemState) {
+		s.RemotePresent = true
+		s.LocalPresent = true
+		s.LastExportedAt = &exportedAt
+		s.LastError = ""
+	})
+	return nil
+}
+
+func (r *serviceFakeRepo) MarkListItemRemoteRemoved(_ context.Context, connectionID string, kind ListKind, mediaItemID string, removedAt time.Time) error {
+	r.markListItem(connectionID, kind, mediaItemID, func(s *ListItemState) {
+		s.RemotePresent = false
+		s.LastRemovedRemoteAt = &removedAt
+		s.LastError = ""
+	})
+	return nil
+}
+
+func (r *serviceFakeRepo) MarkListItemLocalRemoved(_ context.Context, connectionID string, kind ListKind, mediaItemID string, removedAt time.Time) error {
+	r.markListItem(connectionID, kind, mediaItemID, func(s *ListItemState) {
+		s.LocalPresent = false
+		s.LastRemovedLocalAt = &removedAt
+		s.LastError = ""
+	})
+	return nil
+}
+
+func (r *serviceFakeRepo) MarkListItemError(_ context.Context, connectionID string, kind ListKind, mediaItemID, lastError string) error {
+	r.markListItem(connectionID, kind, mediaItemID, func(s *ListItemState) {
+		s.LastError = lastError
+	})
+	return nil
+}
+
+func (r *serviceFakeRepo) ListScrobbleConnections(_ context.Context, _ int, _ string) ([]Connection, error) {
+	conns := make([]Connection, 0, len(r.scrobbleConnections))
+	for _, conn := range r.scrobbleConnections {
+		if conn.RateLimitedUntil != nil && conn.RateLimitedUntil.After(time.Now()) {
+			continue
+		}
+		conns = append(conns, cloneConnectionForTest(conn))
+	}
+	return conns, nil
+}
+
+func (r *serviceFakeRepo) UpsertScrobbleSession(_ context.Context, _ ScrobbleEvent, _ string, _ string) error {
+	return nil
+}
+
+func (r *serviceFakeRepo) PrepareConfirmedScrobbleStop(_ context.Context, event ScrobbleEvent, connectionID string, _ time.Time) (confirmedStopPreparation, time.Time, error) {
+	r.scrobbleMu.Lock()
+	defer r.scrobbleMu.Unlock()
+	key := event.PlaybackSessionID + "|" + connectionID
+	if r.confirmedScrobbles[key] {
+		return confirmedStopAlreadySent, time.Time{}, nil
+	}
+	if !r.confirmingScrobbles[key].IsZero() {
+		return confirmedStopInProgress, time.Time{}, nil
+	}
+	claimVersion := time.Now()
+	r.confirmingScrobbles[key] = claimVersion
+	r.reopenedScrobbles = append(r.reopenedScrobbles, scrobbleUpdate{
+		playbackSessionID: event.PlaybackSessionID,
+		connectionID:      connectionID,
+		action:            "stop",
+		positionSeconds:   event.PositionSeconds,
+		historyID:         event.HistoryID,
+	})
+	return confirmedStopPrepared, claimVersion, nil
+}
+
+func (r *serviceFakeRepo) CompleteConfirmedScrobbleStop(_ context.Context, playbackSessionID string, connectionID string, positionSeconds float64, historyID string, claimVersion time.Time, stopSentAt time.Time) error {
+	r.scrobbleMu.Lock()
+	defer r.scrobbleMu.Unlock()
+	key := playbackSessionID + "|" + connectionID
+	if r.confirmingScrobbles[key] != claimVersion {
+		return errConfirmedStopClaimLost
+	}
+	delete(r.confirmingScrobbles, key)
+	r.confirmedScrobbles[key] = true
+	r.scrobbleUpdates = append(r.scrobbleUpdates, scrobbleUpdate{
+		playbackSessionID: playbackSessionID,
+		connectionID:      connectionID,
+		action:            "stop_confirmed",
+		positionSeconds:   positionSeconds,
+		historyID:         historyID,
+		stopSentAt:        &stopSentAt,
+	})
+	if historyID != "" {
+		r.pendingReconciliations = append(r.pendingReconciliations, ScrobbleSession{
+			PlaybackSessionID: playbackSessionID, ConnectionID: connectionID, HistoryID: historyID,
+		})
+	}
+	return nil
+}
+
+func (r *serviceFakeRepo) FailConfirmedScrobbleStop(_ context.Context, playbackSessionID string, connectionID string, positionSeconds float64, historyID string, claimVersion time.Time, lastError string) error {
+	r.scrobbleMu.Lock()
+	defer r.scrobbleMu.Unlock()
+	key := playbackSessionID + "|" + connectionID
+	if r.confirmingScrobbles[key] != claimVersion {
+		return errConfirmedStopClaimLost
+	}
+	delete(r.confirmingScrobbles, key)
+	r.scrobbleUpdates = append(r.scrobbleUpdates, scrobbleUpdate{
+		playbackSessionID: playbackSessionID,
+		connectionID:      connectionID,
+		action:            "stop_confirming",
+		positionSeconds:   positionSeconds,
+		historyID:         historyID,
+		lastError:         lastError,
+	})
+	return nil
+}
+
+func (r *serviceFakeRepo) UpdateScrobbleSession(_ context.Context, playbackSessionID string, connectionID string, action string, positionSeconds float64, historyID string, lastError string, stopSentAt *time.Time) error {
+	r.scrobbleMu.Lock()
+	defer r.scrobbleMu.Unlock()
+	r.scrobbleUpdates = append(r.scrobbleUpdates, scrobbleUpdate{
+		playbackSessionID: playbackSessionID,
+		connectionID:      connectionID,
+		action:            action,
+		positionSeconds:   positionSeconds,
+		historyID:         historyID,
+		lastError:         lastError,
+		stopSentAt:        stopSentAt,
+	})
+	if stopSentAt != nil && historyID != "" {
+		r.pendingReconciliations = append(r.pendingReconciliations, ScrobbleSession{
+			PlaybackSessionID: playbackSessionID, ConnectionID: connectionID, HistoryID: historyID,
+		})
+	}
+	return nil
+}
+
+func (r *serviceFakeRepo) ListOpenScrobbleSessions(_ context.Context) ([]ScrobbleSession, error) {
+	r.scrobbleMu.Lock()
+	defer r.scrobbleMu.Unlock()
+	return append([]ScrobbleSession(nil), r.scrobbleSessions...), nil
+}
+
+func (r *serviceFakeRepo) ListPendingScrobbleReconciliations(_ context.Context) ([]ScrobbleSession, error) {
+	r.scrobbleMu.Lock()
+	defer r.scrobbleMu.Unlock()
+	return append([]ScrobbleSession(nil), r.pendingReconciliations...), nil
+}
+
+func (r *serviceFakeRepo) MarkScrobbleHistoryReconciled(_ context.Context, playbackSessionID, connectionID string, reconciledAt time.Time) error {
+	r.scrobbleMu.Lock()
+	defer r.scrobbleMu.Unlock()
+	key := playbackSessionID + "|" + connectionID
+	r.reconciledScrobbles[key] = reconciledAt
+	remaining := r.pendingReconciliations[:0]
+	for _, session := range r.pendingReconciliations {
+		if session.PlaybackSessionID == playbackSessionID && session.ConnectionID == connectionID {
+			continue
+		}
+		remaining = append(remaining, session)
+	}
+	r.pendingReconciliations = remaining
+	return nil
+}
+
+func (r *serviceFakeRepo) syncRunsSnapshot() []SyncRun {
+	r.syncRunMu.Lock()
+	defer r.syncRunMu.Unlock()
+	return append([]SyncRun(nil), r.syncRuns...)
+}
+
+func (r *serviceFakeRepo) scrobbleUpdatesSnapshot() []scrobbleUpdate {
+	r.scrobbleMu.Lock()
+	defer r.scrobbleMu.Unlock()
+	return append([]scrobbleUpdate(nil), r.scrobbleUpdates...)
+}
+
+func connectionKey(provider string, userID int, profileID string) string {
+	return provider + "|" + strconv.Itoa(userID) + "|" + profileID
+}
+
+func cloneConnectionForTest(conn Connection) Connection {
+	conn.SyncCursors = cloneStringMapForTest(conn.SyncCursors)
+	return conn
+}
+
+func cloneStringMapForTest(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return map[string]string{}
+	}
+	clone := make(map[string]string, len(values))
+	for key, value := range values {
+		clone[key] = value
+	}
+	return clone
+}
+
+type authProviderStub struct {
+	started       bool
+	polled        bool
+	pollErr       error
+	refreshed     bool
+	refreshTokens TokenSet
+	refreshErr    error
+}
+
+func (p *authProviderStub) Key() string {
+	return "trakt"
+}
+
+func (p *authProviderStub) DisplayName() string {
+	return "Trakt"
+}
+
+func (p *authProviderStub) Capabilities() Capabilities {
+	return Capabilities{}
+}
+
+func (p *authProviderStub) StartDeviceAuth(
+	context.Context,
+	ServerConfig,
+) (DeviceAuthSession, error) {
+	p.started = true
+	return DeviceAuthSession{
+		Provider:        "trakt",
+		DeviceCode:      "device",
+		UserCode:        "CODE",
+		VerificationURL: "https://trakt.tv/activate",
+		IntervalSeconds: 5,
+		ExpiresAt:       time.Now().Add(time.Minute),
+	}, nil
+}
+
+func (p *authProviderStub) PollDeviceAuth(
+	context.Context,
+	ServerConfig,
+	DeviceAuthSession,
+) (TokenSet, error) {
+	p.polled = true
+	if p.pollErr != nil {
+		return TokenSet{}, p.pollErr
+	}
+	expires := time.Now().Add(time.Hour)
+	return TokenSet{AccessToken: testAccessToken, RefreshToken: testRefreshToken, TokenExpiresAt: &expires}, nil
+}
+
+func (p *authProviderStub) RefreshToken(context.Context, ServerConfig, Connection) (TokenSet, error) {
+	p.refreshed = true
+	if p.refreshErr != nil {
+		return TokenSet{}, p.refreshErr
+	}
+	return p.refreshTokens, nil
+}
+
+func (p *authProviderStub) LookupAccount(
+	context.Context,
+	ServerConfig,
+	Connection,
+) (ProviderAccount, error) {
+	return ProviderAccount{ID: "trakt-user-1", Username: "alex"}, nil
+}
+
+type emptyPluginAPIKeyProvider struct{}
+
+func (emptyPluginAPIKeyProvider) Key() string { return "plugin:1:tracker" }
+
+func (emptyPluginAPIKeyProvider) DisplayName() string { return "Tracker" }
+
+func (emptyPluginAPIKeyProvider) Capabilities() Capabilities { return Capabilities{} }
+
+func (emptyPluginAPIKeyProvider) ProviderSource() string { return providerSourcePlugin }
+
+func (emptyPluginAPIKeyProvider) ConnectWithAPIKey(context.Context, string) (TokenSet, ProviderAccount, error) {
+	return TokenSet{}, ProviderAccount{ID: testProviderAccountID}, nil
+}
+
+type watchedImporterStub struct {
+	key    string
+	source userstore.WatchHistorySource
+	rows   []RemoteWatch
+}
+
+func (p watchedImporterStub) Key() string {
+	if p.key != "" {
+		return p.key
+	}
+	return "trakt"
+}
+
+func (p watchedImporterStub) DisplayName() string {
+	return "Trakt"
+}
+
+func (p watchedImporterStub) Capabilities() Capabilities {
+	return Capabilities{ImportWatched: true}
+}
+
+func (p watchedImporterStub) FetchWatched(context.Context, ServerConfig, Connection) ([]RemoteWatch, error) {
+	return p.rows, nil
+}
+
+func (p watchedImporterStub) HistorySource() userstore.WatchHistorySource {
+	if p.source == "" {
+		return userstore.WatchHistorySourceTrakt
+	}
+	return p.source
+}
+
+type watchedBatchImporterStub struct {
+	watchedImporterStub
+	batch WatchedImportBatch
+}
+
+func (p watchedBatchImporterStub) FetchWatchedBatch(context.Context, ServerConfig, Connection) (WatchedImportBatch, error) {
+	return p.batch, nil
+}
+
+type progressImporterStub struct {
+	rows []RemoteProgress
+}
+
+func (p progressImporterStub) FetchProgress(context.Context, ServerConfig, Connection) ([]RemoteProgress, error) {
+	return p.rows, nil
+}
+
+type progressBatchImporterStub struct {
+	progressImporterStub
+	batch ProgressImportBatch
+}
+
+func (p progressBatchImporterStub) FetchProgressBatch(context.Context, ServerConfig, Connection) (ProgressImportBatch, error) {
+	return p.batch, nil
+}
+
+type watchedExporterStub struct {
+	exportErr    error
+	exportResult ExportResult
+	key          string
+	source       userstore.WatchHistorySource
+}
+
+func (p watchedExporterStub) Key() string {
+	if p.key != "" {
+		return p.key
+	}
+	return "trakt"
+}
+
+func (p watchedExporterStub) DisplayName() string {
+	return "Trakt"
+}
+
+func (p watchedExporterStub) Capabilities() Capabilities {
+	return Capabilities{ExportWatched: true}
+}
+
+func (p watchedExporterStub) FetchHistory(context.Context, ServerConfig, Connection) ([]RemotePlay, error) {
+	return nil, nil
+}
+
+func (p watchedExporterStub) ExportHistory(context.Context, ServerConfig, Connection, []LocalPlay) (ExportResult, error) {
+	return p.exportResult, p.exportErr
+}
+
+func (p watchedExporterStub) HistorySource() userstore.WatchHistorySource {
+	if p.source == "" {
+		return userstore.WatchHistorySourceTrakt
+	}
+	return p.source
+}
+
+type watchedImportExportStub struct {
+	key       string
+	source    userstore.WatchHistorySource
+	rows      []RemoteWatch
+	exportErr error
+}
+
+func (p watchedImportExportStub) Key() string {
+	if p.key != "" {
+		return p.key
+	}
+	return "trakt"
+}
+
+func (p watchedImportExportStub) DisplayName() string {
+	return "Trakt"
+}
+
+func (p watchedImportExportStub) Capabilities() Capabilities {
+	return Capabilities{ImportWatched: true, ExportWatched: true}
+}
+
+func (p watchedImportExportStub) FetchWatched(context.Context, ServerConfig, Connection) ([]RemoteWatch, error) {
+	return p.rows, nil
+}
+
+func (p watchedImportExportStub) FetchHistory(context.Context, ServerConfig, Connection) ([]RemotePlay, error) {
+	return nil, nil
+}
+
+func (p watchedImportExportStub) ExportHistory(_ context.Context, _ ServerConfig, _ Connection, plays []LocalPlay) (ExportResult, error) {
+	if p.exportErr != nil {
+		return ExportResult{}, p.exportErr
+	}
+	result := ExportResult{Sent: make([]string, 0, len(plays))}
+	for _, play := range plays {
+		result.Sent = append(result.Sent, play.HistoryID)
+	}
+	return result, nil
+}
+
+func (p watchedImportExportStub) HistorySource() userstore.WatchHistorySource {
+	if p.source == "" {
+		return userstore.WatchHistorySourceTrakt
+	}
+	return p.source
+}
+
+type scrobblerStub struct {
+	stopErr       error
+	refreshed     bool
+	refreshTokens TokenSet
+	refreshErr    error
+	stopConns     chan Connection
+	stopEvents    chan ScrobbleEvent
+	stopStarted   chan struct{}
+	stopRelease   chan struct{}
+	stopFailures  *atomic.Int32
+}
+
+type keyedScrobblerStub struct {
+	scrobblerStub
+	key string
+}
+
+func (p keyedScrobblerStub) Key() string {
+	return p.key
+}
+
+func (p keyedScrobblerStub) DisplayName() string {
+	return p.key
+}
+
+func (p scrobblerStub) Key() string {
+	return "trakt"
+}
+
+func (p scrobblerStub) DisplayName() string {
+	return "Trakt"
+}
+
+func (p scrobblerStub) Capabilities() Capabilities {
+	return Capabilities{ScrobblePlayback: true}
+}
+
+type watchedScrobblerStub struct{ scrobblerStub }
+
+func (watchedScrobblerStub) Capabilities() Capabilities {
+	return Capabilities{ScrobblePlayback: true, ExportWatched: true}
+}
+
+func (p scrobblerStub) Start(context.Context, ServerConfig, Connection, ScrobbleEvent) error {
+	return nil
+}
+
+func (p scrobblerStub) Pause(context.Context, ServerConfig, Connection, ScrobbleEvent) error {
+	return nil
+}
+
+func (p scrobblerStub) Stop(_ context.Context, _ ServerConfig, conn Connection, event ScrobbleEvent) error {
+	if p.stopStarted != nil {
+		p.stopStarted <- struct{}{}
+	}
+	if p.stopRelease != nil {
+		<-p.stopRelease
+	}
+	if p.stopConns != nil {
+		p.stopConns <- conn
+	}
+	if p.stopEvents != nil {
+		p.stopEvents <- event
+	}
+	if p.stopFailures != nil && p.stopFailures.Add(-1) >= 0 {
+		return errors.New("stop failed")
+	}
+	return p.stopErr
+}
+
+func (p *scrobblerStub) RefreshToken(context.Context, ServerConfig, Connection) (TokenSet, error) {
+	p.refreshed = true
+	if p.refreshErr != nil {
+		return TokenSet{}, p.refreshErr
+	}
+	return p.refreshTokens, nil
+}
+
+func (p *scrobblerStub) StartDeviceAuth(context.Context, ServerConfig) (DeviceAuthSession, error) {
+	return DeviceAuthSession{}, nil
+}
+
+func (p *scrobblerStub) PollDeviceAuth(context.Context, ServerConfig, DeviceAuthSession) (TokenSet, error) {
+	return TokenSet{}, nil
+}
+
+func (p *scrobblerStub) LookupAccount(context.Context, ServerConfig, Connection) (ProviderAccount, error) {
+	return ProviderAccount{}, nil
+}
+
+type orderedScrobblerStub struct {
+	mu      sync.Mutex
+	calls   []string
+	started chan string
+	release chan struct{}
+}
+
+func newOrderedScrobblerStub() *orderedScrobblerStub {
+	stub := &orderedScrobblerStub{
+		started: make(chan string, 3),
+		release: make(chan struct{}),
+	}
+	return stub
+}
+
+func (p *orderedScrobblerStub) Key() string {
+	return "simkl"
+}
+
+func (p *orderedScrobblerStub) DisplayName() string {
+	return "Simkl"
+}
+
+func (p *orderedScrobblerStub) Capabilities() Capabilities {
+	return Capabilities{ScrobblePlayback: true}
+}
+
+func (p *orderedScrobblerStub) ScrobbleOrderingKey(conn Connection, _ ScrobbleEvent) string {
+	return "simkl:" + conn.ID
+}
+
+func (p *orderedScrobblerStub) Start(context.Context, ServerConfig, Connection, ScrobbleEvent) error {
+	return p.record("start")
+}
+
+func (p *orderedScrobblerStub) Pause(context.Context, ServerConfig, Connection, ScrobbleEvent) error {
+	return p.record("pause")
+}
+
+func (p *orderedScrobblerStub) Stop(context.Context, ServerConfig, Connection, ScrobbleEvent) error {
+	return p.record("stop")
+}
+
+func (p *orderedScrobblerStub) record(action string) error {
+	p.started <- action
+	<-p.release
+	p.mu.Lock()
+	p.calls = append(p.calls, action)
+	p.mu.Unlock()
+	return nil
+}
+
+func (p *orderedScrobblerStub) waitCalls(t *testing.T, count int) []string {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		p.mu.Lock()
+		if len(p.calls) >= count {
+			calls := append([]string{}, p.calls...)
+			p.mu.Unlock()
+			return calls
+		}
+		calls := append([]string{}, p.calls...)
+		p.mu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatalf("calls = %+v, want %d", calls, count)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+type staticStoreProvider struct {
+	store userstore.UserStore
+}
+
+func (p staticStoreProvider) ForUser(context.Context, int) (userstore.UserStore, error) {
+	return p.store, nil
+}
+
+func (p staticStoreProvider) Close() error {
+	return nil
+}
+
+type unmatchedMatcherStub struct {
+	reason string
+}
+
+func (m unmatchedMatcherStub) Match(context.Context, historyimport.Record) (*historyimport.Match, string, error) {
+	return nil, m.reason, nil
+}
+
+type matchedMatcherStub struct {
+	mediaItemID string
+}
+
+func (m matchedMatcherStub) Match(context.Context, historyimport.Record) (*historyimport.Match, string, error) {
+	return &historyimport.Match{MediaItemID: m.mediaItemID}, "", nil
+}
+
+type noOpWatchState struct{}
+
+func (noOpWatchState) RecordImportedHistoryWithSource(
+	context.Context,
+	int,
+	string,
+	string,
+	float64,
+	bool,
+	*time.Time,
+	userstore.WatchHistorySource,
+) (bool, error) {
+	return false, nil
+}
+
+func (noOpWatchState) RecordImportedWatchIfNewerWithSource(
+	context.Context,
+	int,
+	string,
+	string,
+	float64,
+	float64,
+	bool,
+	time.Time,
+	*time.Time,
+	userstore.WatchHistorySource,
+) (bool, error) {
+	return false, nil
+}
+
+type recordingWatchState struct {
+	sources   []userstore.WatchHistorySource
+	updatedAt []time.Time
+	watchedAt []*time.Time
+	completed []bool
+	positions []float64
+	durations []float64
+	targetIDs []string
+}
+
+func (s *recordingWatchState) RecordImportedHistoryWithSource(
+	_ context.Context,
+	_ int,
+	_ string,
+	_ string,
+	_ float64,
+	_ bool,
+	_ *time.Time,
+	source userstore.WatchHistorySource,
+) (bool, error) {
+	s.sources = append(s.sources, source)
+	return true, nil
+}
+
+func (s *recordingWatchState) RecordImportedWatchIfNewerWithSource(
+	_ context.Context,
+	_ int,
+	_ string,
+	targetID string,
+	duration float64,
+	position float64,
+	completed bool,
+	updatedAt time.Time,
+	watchedAt *time.Time,
+	source userstore.WatchHistorySource,
+) (bool, error) {
+	s.sources = append(s.sources, source)
+	s.updatedAt = append(s.updatedAt, updatedAt)
+	s.watchedAt = append(s.watchedAt, watchedAt)
+	s.completed = append(s.completed, completed)
+	s.positions = append(s.positions, position)
+	s.durations = append(s.durations, duration)
+	s.targetIDs = append(s.targetIDs, targetID)
+	return true, nil
+}
+
+func TestServiceStartsAndPollsDeviceAuth(t *testing.T) {
+	repo := newServiceFakeRepo()
+	provider := &authProviderStub{}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	service := NewService(repo, reg)
+
+	session, err := service.StartDeviceAuth(context.Background(), 7, "profile-1", "trakt")
+	if err != nil {
+		t.Fatalf("StartDeviceAuth: %v", err)
+	}
+	if !provider.started || session.ID != "auth-1" {
+		t.Fatalf("session = %+v started=%v", session, provider.started)
+	}
+
+	conn, err := service.PollDeviceAuth(context.Background(), 7, "profile-1", "trakt", session.ID)
+	if err != nil {
+		t.Fatalf("PollDeviceAuth: %v", err)
+	}
+	if conn.ProviderUsername != "alex" || conn.AccessToken != testAccessToken {
+		t.Fatalf("connection = %+v", conn)
+	}
+	if !conn.ImportWatchedEnabled || !conn.ImportProgressEnabled ||
+		!conn.ExportWatchedEnabled || !conn.ScrobbleEnabled {
+		t.Fatalf("default toggles were not enabled: %+v", conn)
+	}
+	storedSession := repo.sessions[session.ID]
+	if storedSession.CompletedAt == nil {
+		t.Fatalf("auth session was not marked completed: %+v", storedSession)
+	}
+}
+
+func TestServicePersistsRotatedPendingDeviceAuthorizationState(t *testing.T) {
+	repo := newServiceFakeRepo()
+	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	original := DeviceAuthSession{
+		ID: "auth-1", Provider: "trakt", UserID: 7, ProfileID: "profile-1",
+		DeviceCode: "original", UserCode: "CODE", VerificationURL: "https://trakt.tv/activate",
+		IntervalSeconds: 5, ExpiresAt: now.Add(10 * time.Minute),
+	}
+	repo.sessions[original.ID] = original
+	provider := &authProviderStub{pollErr: deviceAuthorizationPendingError{session: DeviceAuthSession{
+		// These host-owned fields are intentionally wrong; only the rotated
+		// challenge state, interval, and expiry may be accepted from the provider.
+		ID: "wrong", Provider: "wrong", UserID: 99, ProfileID: "wrong",
+		DeviceCode: "rotated", UserCode: "WRONG", VerificationURL: "https://evil.example",
+		IntervalSeconds: 11, ExpiresAt: now.Add(20 * time.Minute),
+	}}}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(repo, reg)
+	service.now = func() time.Time { return now }
+	_, err := service.PollDeviceAuth(context.Background(), 7, "profile-1", "trakt", original.ID)
+	var pending deviceAuthorizationPendingError
+	if !errors.As(err, &pending) {
+		t.Fatalf("error = %#v, want pending", err)
+	}
+	stored := repo.sessions[original.ID]
+	if stored.ID != original.ID || stored.Provider != original.Provider || stored.UserID != original.UserID ||
+		stored.ProfileID != original.ProfileID || stored.UserCode != original.UserCode ||
+		stored.VerificationURL != original.VerificationURL || stored.DeviceCode != "rotated" ||
+		stored.IntervalSeconds != 11 || !stored.ExpiresAt.Equal(now.Add(20*time.Minute)) {
+		t.Fatalf("stored session = %#v", stored)
+	}
+}
+
+func TestServiceStartsAndPollsDeviceAuthRejectsMismatchedSession(t *testing.T) {
+	repo := newServiceFakeRepo()
+	provider := &authProviderStub{}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	service := NewService(repo, reg)
+
+	session, err := service.StartDeviceAuth(context.Background(), 7, "profile-1", "trakt")
+	if err != nil {
+		t.Fatalf("StartDeviceAuth: %v", err)
+	}
+	_, err = service.PollDeviceAuth(context.Background(), 7, "profile-2", "trakt", session.ID)
+	if err == nil {
+		t.Fatal("expected mismatched profile to be rejected")
+	}
+	if provider.polled {
+		t.Fatal("provider was polled before session ownership was verified")
+	}
+}
+
+func TestServiceRejectsMissingProfileScope(t *testing.T) {
+	repo := newServiceFakeRepo()
+	provider := &authProviderStub{}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	service := NewService(repo, reg)
+
+	if _, err := service.StartDeviceAuth(context.Background(), 0, "profile-1", "trakt"); err == nil {
+		t.Fatal("expected missing user id to be rejected")
+	}
+	if _, err := service.StartDeviceAuth(context.Background(), 7, "", "trakt"); err == nil {
+		t.Fatal("expected missing profile id to be rejected")
+	}
+	if _, err := service.PollDeviceAuth(context.Background(), 7, "profile-1", "trakt", ""); err == nil {
+		t.Fatal("expected missing auth session id to be rejected")
+	}
+	if provider.started || provider.polled {
+		t.Fatal("provider was called for invalid profile scope")
+	}
+}
+
+func TestServicePollDeviceAuthRejectsExpiredOrCompletedSession(t *testing.T) {
+	repo := newServiceFakeRepo()
+	provider := &authProviderStub{}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	service := NewService(repo, reg)
+	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	service.now = func() time.Time { return now }
+
+	repo.sessions["expired"] = DeviceAuthSession{
+		ID:        "expired",
+		Provider:  "trakt",
+		UserID:    7,
+		ProfileID: "profile-1",
+		ExpiresAt: now.Add(-time.Second),
+	}
+	if _, err := service.PollDeviceAuth(context.Background(), 7, "profile-1", "trakt", "expired"); err == nil {
+		t.Fatal("expected expired session to be rejected")
+	}
+
+	completedAt := now.Add(-time.Minute)
+	repo.sessions["completed"] = DeviceAuthSession{
+		ID:          "completed",
+		Provider:    "trakt",
+		UserID:      7,
+		ProfileID:   "profile-1",
+		ExpiresAt:   now.Add(time.Minute),
+		CompletedAt: &completedAt,
+	}
+	if _, err := service.PollDeviceAuth(context.Background(), 7, "profile-1", "trakt", "completed"); err == nil {
+		t.Fatal("expected completed session to be rejected")
+	}
+	if provider.polled {
+		t.Fatal("provider was polled for expired or completed session")
+	}
+}
+
+func TestServicePollDeviceAuthPreservesExistingConnectionToggles(t *testing.T) {
+	repo := newServiceFakeRepo()
+	provider := &authProviderStub{}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	service := NewService(repo, reg)
+
+	existing := Connection{
+		ID:                    "existing-conn",
+		Provider:              "trakt",
+		UserID:                7,
+		ProfileID:             "profile-1",
+		ImportWatchedEnabled:  false,
+		ImportProgressEnabled: false,
+		ExportWatchedEnabled:  true,
+		ScrobbleEnabled:       true,
+	}
+	repo.connections[connectionKey("trakt", 7, "profile-1")] = existing
+	repo.sessions["auth-1"] = DeviceAuthSession{
+		ID:        "auth-1",
+		Provider:  "trakt",
+		UserID:    7,
+		ProfileID: "profile-1",
+		ExpiresAt: time.Now().Add(time.Minute),
+	}
+
+	conn, err := service.PollDeviceAuth(context.Background(), 7, "profile-1", "trakt", "auth-1")
+	if err != nil {
+		t.Fatalf("PollDeviceAuth: %v", err)
+	}
+	if conn.ID != existing.ID {
+		t.Fatalf("connection ID = %q, want existing ID %q", conn.ID, existing.ID)
+	}
+	if conn.ImportWatchedEnabled || conn.ImportProgressEnabled ||
+		!conn.ExportWatchedEnabled || !conn.ScrobbleEnabled {
+		t.Fatalf("connection toggles were not preserved: %+v", conn)
+	}
+	if conn.AccessToken != testAccessToken || conn.ProviderUsername != "alex" {
+		t.Fatalf("connection credentials/account were not refreshed: %+v", conn)
+	}
+}
+
+func TestServiceRequestManualSyncCreatesAsyncRun(t *testing.T) {
+	repo := newServiceFakeRepo()
+	provider := &authProviderStub{}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	service := NewService(repo, reg)
+	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	service.now = func() time.Time { return now }
+	repo.connections[connectionKey("trakt", 7, "profile-1")] = Connection{
+		ID:        "conn-1",
+		Provider:  "trakt",
+		UserID:    7,
+		ProfileID: "profile-1",
+	}
+
+	result, err := service.RequestManualSync(context.Background(), 7, "profile-1", "trakt")
+	if err != nil {
+		t.Fatalf("RequestManualSync: %v", err)
+	}
+	if result.Run.ID == "" || result.Run.Status != string(SyncRunStatusRunning) {
+		t.Fatalf("run = %+v, want running run", result.Run)
+	}
+	if result.RetryAfterSeconds != 0 {
+		t.Fatalf("retry after = %d, want 0", result.RetryAfterSeconds)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		latest, ok, err := repo.GetLatestSyncRun(context.Background(), "conn-1")
+		if err != nil {
+			t.Fatalf("GetLatestSyncRun: %v", err)
+		}
+		if ok && latest.Status == string(SyncRunStatusSuccess) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("sync run did not complete: %+v", repo.syncRunsSnapshot())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestServiceRequestManualSyncReturnsActiveRun(t *testing.T) {
+	repo := newServiceFakeRepo()
+	provider := &authProviderStub{}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	service := NewService(repo, reg)
+	repo.connections[connectionKey("trakt", 7, "profile-1")] = Connection{
+		ID:        "conn-1",
+		Provider:  "trakt",
+		UserID:    7,
+		ProfileID: "profile-1",
+	}
+	repo.syncRuns = append(repo.syncRuns, SyncRun{
+		ID:           "active-run",
+		ConnectionID: "conn-1",
+		Provider:     "trakt",
+		Trigger:      "manual",
+		Status:       string(SyncRunStatusRunning),
+		StartedAt:    time.Now(),
+		CreatedAt:    time.Now(),
+	})
+
+	result, err := service.RequestManualSync(context.Background(), 7, "profile-1", "trakt")
+	if err != nil {
+		t.Fatalf("RequestManualSync: %v", err)
+	}
+	if result.Run.ID != "active-run" {
+		t.Fatalf("run ID = %q, want active-run", result.Run.ID)
+	}
+	if len(repo.syncRuns) != 1 {
+		t.Fatalf("sync runs = %d, want 1", len(repo.syncRuns))
+	}
+}
+
+func TestServiceRequestManualSyncCooldown(t *testing.T) {
+	repo := newServiceFakeRepo()
+	provider := &authProviderStub{}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	service := NewService(repo, reg)
+	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	service.now = func() time.Time { return now }
+	completedAt := now.Add(-30 * time.Minute)
+	repo.connections[connectionKey("trakt", 7, "profile-1")] = Connection{
+		ID:        "conn-1",
+		Provider:  "trakt",
+		UserID:    7,
+		ProfileID: "profile-1",
+	}
+	repo.syncRuns = append(repo.syncRuns, SyncRun{
+		ID:           "recent-run",
+		ConnectionID: "conn-1",
+		Provider:     "trakt",
+		Trigger:      "scheduled",
+		Status:       string(SyncRunStatusSuccess),
+		StartedAt:    completedAt.Add(-time.Minute),
+		CompletedAt:  &completedAt,
+		CreatedAt:    completedAt.Add(-time.Minute),
+	})
+
+	_, err := service.RequestManualSync(context.Background(), 7, "profile-1", "trakt")
+	var cooldown SyncCooldownError
+	if !errors.As(err, &cooldown) {
+		t.Fatalf("error = %v, want SyncCooldownError", err)
+	}
+	if cooldown.RetryAfterSeconds != 30*60 {
+		t.Fatalf("retry after = %d, want %d", cooldown.RetryAfterSeconds, 30*60)
+	}
+}
+
+func TestServiceConnectionStatusRejectsBlankAccessToken(t *testing.T) {
+	repo := newServiceFakeRepo()
+	provider := &authProviderStub{}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	repo.connections[connectionKey("trakt", 7, "profile-1")] = Connection{
+		ID:          "conn-1",
+		Provider:    "trakt",
+		UserID:      7,
+		ProfileID:   "profile-1",
+		AccessToken: "   ",
+	}
+
+	status, err := NewService(repo, reg).GetConnectionStatus(context.Background(), 7, "profile-1", "trakt")
+	if err != nil {
+		t.Fatalf("GetConnectionStatus: %v", err)
+	}
+	if status.Connected {
+		t.Fatalf("status = %+v, want disconnected for blank access token", status)
+	}
+	if status.LastError == "" {
+		t.Fatalf("status = %+v, want reconnect error", status)
+	}
+}
+
+func TestServiceSyncConnectionRejectsBlankAccessToken(t *testing.T) {
+	repo := newServiceFakeRepo()
+	provider := watchedExporterStub{}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	conn := Connection{
+		ID:                   "conn-1",
+		Provider:             "trakt",
+		UserID:               7,
+		ProfileID:            "profile-1",
+		AccessToken:          "",
+		ExportWatchedEnabled: true,
+	}
+	repo.connections[connectionKey("trakt", 7, "profile-1")] = conn
+
+	err := NewService(repo, reg).SyncConnection(context.Background(), conn, "scheduled")
+	if err == nil {
+		t.Fatal("SyncConnection error = nil, want blank token error")
+	}
+	latest, ok, err := repo.GetLatestSyncRun(context.Background(), "conn-1")
+	if err != nil {
+		t.Fatalf("GetLatestSyncRun: %v", err)
+	}
+	if !ok || latest.Status != string(SyncRunStatusFailed) || latest.Error == "" {
+		t.Fatalf("latest run = %+v, want failed blank token run", latest)
+	}
+}
+
+func TestServiceSyncConnectionRefreshesExpiredToken(t *testing.T) {
+	repo := newServiceFakeRepo()
+	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	expiresAt := now.Add(-time.Minute)
+	refreshedExpiresAt := now.Add(time.Hour)
+	provider := &authProviderStub{
+		refreshTokens: TokenSet{
+			AccessToken:    "new-access",
+			RefreshToken:   "new-refresh",
+			TokenExpiresAt: &refreshedExpiresAt,
+		},
+	}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	service := NewService(repo, reg)
+	service.now = func() time.Time { return now }
+	conn := Connection{
+		ID:             "conn-1",
+		Provider:       "trakt",
+		UserID:         7,
+		ProfileID:      "profile-1",
+		AccessToken:    testOldAccessToken,
+		RefreshToken:   testOldRefreshToken,
+		TokenExpiresAt: &expiresAt,
+	}
+	repo.connections[connectionKey("trakt", 7, "profile-1")] = conn
+
+	if err := service.SyncConnection(context.Background(), conn, "scheduled"); err != nil {
+		t.Fatalf("SyncConnection: %v", err)
+	}
+	if !provider.refreshed {
+		t.Fatal("provider was not asked to refresh the expired token")
+	}
+	updated := repo.connections[connectionKey("trakt", 7, "profile-1")]
+	if updated.AccessToken != "new-access" || updated.RefreshToken != "new-refresh" {
+		t.Fatalf("connection tokens = %q/%q, want refreshed tokens", updated.AccessToken, updated.RefreshToken)
+	}
+	if updated.TokenExpiresAt == nil || !updated.TokenExpiresAt.Equal(refreshedExpiresAt) {
+		t.Fatalf("token expiry = %v, want %v", updated.TokenExpiresAt, refreshedExpiresAt)
+	}
+}
+
+func TestServicePluginRefreshPersistsAuthoritativeCredentialsBeforeFault(t *testing.T) {
+	repo := newServiceFakeRepo()
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	expiresAt := now.Add(-time.Minute)
+	client := &fakeWatchSyncPluginClient{refreshResponse: &pluginv1.WatchSyncCredentialResponse{
+		Credentials: &pluginv1.WatchSyncCredentials{AccessToken: testRotatedAccessToken, TokenType: testBearerTokenType},
+		Fault: &pluginv1.WatchSyncFault{
+			Code:        pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_INVALID_CREDENTIAL,
+			SafeMessage: testReconnectRequired,
+		},
+	}}
+	provider := testPluginProvider(t, client)
+	service := NewService(repo, NewRegistry())
+	service.now = func() time.Time { return now }
+	conn := Connection{
+		ID:             "conn-1",
+		Provider:       provider.Key(),
+		UserID:         7,
+		ProfileID:      "profile-1",
+		AccessToken:    testOldAccessToken,
+		RefreshToken:   testOldRefreshToken,
+		TokenExpiresAt: &expiresAt,
+	}
+	repo.connections[connectionKey(conn.Provider, conn.UserID, conn.ProfileID)] = conn
+
+	if _, err := service.refreshConnectionIfNeeded(context.Background(), provider, ServerConfig{}, conn); !isWatchSyncInvalidCredentialError(err) {
+		t.Fatalf("error = %#v", err)
+	}
+	updated := repo.connections[connectionKey(conn.Provider, conn.UserID, conn.ProfileID)]
+	if updated.AccessToken != testRotatedAccessToken || updated.RefreshToken != "" || updated.TokenExpiresAt != nil {
+		t.Fatalf("connection credentials = %#v", updated)
+	}
+	if updated.LastError != testReconnectRequired {
+		t.Fatalf("LastError = %q", updated.LastError)
+	}
+}
+
+func TestServiceSyncConnectionTreatsMatcherWarningsAsSuccess(t *testing.T) {
+	repo := newServiceFakeRepo()
+	watchedAt := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	provider := watchedImporterStub{rows: []RemoteWatch{{
+		Provider:      "trakt",
+		Kind:          "movie",
+		Title:         "Ghost Hunters",
+		Year:          2019,
+		LastWatchedAt: &watchedAt,
+	}}}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	service := NewService(repo, reg).
+		WithMatcher(unmatchedMatcherStub{reason: `no tmdb_id match for "92820"`}).
+		WithWatchState(noOpWatchState{})
+	conn := Connection{
+		ID:                   "conn-1",
+		Provider:             "trakt",
+		UserID:               7,
+		ProfileID:            "profile-1",
+		AccessToken:          testAccessToken,
+		ImportWatchedEnabled: true,
+	}
+
+	if err := service.SyncConnection(context.Background(), conn, "scheduled"); err != nil {
+		t.Fatalf("SyncConnection: %v", err)
+	}
+	latest, ok, err := repo.GetLatestSyncRun(context.Background(), "conn-1")
+	if err != nil {
+		t.Fatalf("GetLatestSyncRun: %v", err)
+	}
+	if !ok || latest.Status != string(SyncRunStatusSuccess) {
+		t.Fatalf("latest run = %+v, want success run", latest)
+	}
+	if latest.Warning == "" {
+		t.Fatalf("latest run warning is empty: %+v", latest)
+	}
+}
+
+func TestServiceImportWatchedUsesProviderHistorySource(t *testing.T) {
+	repo := newServiceFakeRepo()
+	watchedAt := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	provider := watchedImporterStub{
+		key:    "simkl",
+		source: userstore.WatchHistorySourceSimkl,
+		rows: []RemoteWatch{{
+			Provider:      "simkl",
+			Kind:          historyimport.KindMovie,
+			Title:         "Inception",
+			Year:          2010,
+			LastWatchedAt: &watchedAt,
+		}},
+	}
+	watchState := &recordingWatchState{}
+	service := NewService(repo, NewRegistry()).
+		WithMatcher(matchedMatcherStub{mediaItemID: testMovieMediaID}).
+		WithWatchState(watchState)
+
+	result, err := service.ImportWatched(context.Background(), Connection{
+		ID:        "conn-1",
+		Provider:  "simkl",
+		UserID:    7,
+		ProfileID: "profile-1",
+	}, ServerConfig{}, provider)
+	if err != nil {
+		t.Fatalf("ImportWatched: %v", err)
+	}
+	if result.Imported != 1 {
+		t.Fatalf("imported = %d, want 1", result.Imported)
+	}
+	if len(watchState.sources) != 1 || watchState.sources[0] != userstore.WatchHistorySourceSimkl {
+		t.Fatalf("recorded sources = %+v, want simkl", watchState.sources)
+	}
+	if len(watchState.targetIDs) != 1 || watchState.targetIDs[0] != testMovieMediaID {
+		t.Fatalf("recorded target ids = %+v, want movie-1", watchState.targetIDs)
+	}
+	if len(watchState.completed) != 1 || !watchState.completed[0] {
+		t.Fatalf("recorded completed flags = %+v, want true", watchState.completed)
+	}
+	if len(watchState.positions) != 1 || watchState.positions[0] != 0 {
+		t.Fatalf("recorded positions = %+v, want 0", watchState.positions)
+	}
+	if len(watchState.updatedAt) != 1 || !watchState.updatedAt[0].Equal(watchedAt) {
+		t.Fatalf("recorded updated_at = %+v, want %v", watchState.updatedAt, watchedAt)
+	}
+	if len(watchState.watchedAt) != 1 || watchState.watchedAt[0] == nil || !watchState.watchedAt[0].Equal(watchedAt) {
+		t.Fatalf("recorded watched_at = %+v, want %v", watchState.watchedAt, watchedAt)
+	}
+}
+
+func TestServiceImportWatchedSkipsRowsWithoutLastWatchedAt(t *testing.T) {
+	repo := newServiceFakeRepo()
+	provider := watchedImporterStub{
+		rows: []RemoteWatch{{
+			Provider: "trakt",
+			Kind:     historyimport.KindMovie,
+			Title:    "Inception",
+			Year:     2010,
+		}},
+	}
+	watchState := &recordingWatchState{}
+	service := NewService(repo, NewRegistry()).
+		WithMatcher(matchedMatcherStub{mediaItemID: testMovieMediaID}).
+		WithWatchState(watchState)
+
+	result, err := service.ImportWatched(context.Background(), Connection{
+		ID:        "conn-1",
+		Provider:  "trakt",
+		UserID:    7,
+		ProfileID: "profile-1",
+	}, ServerConfig{}, provider)
+	if err != nil {
+		t.Fatalf("ImportWatched: %v", err)
+	}
+	if result.Found != 1 || result.Imported != 0 {
+		t.Fatalf("result = %+v, want found row skipped with no import", result)
+	}
+	if len(watchState.targetIDs) != 0 {
+		t.Fatalf("watch state calls = %+v, want none", watchState.targetIDs)
+	}
+}
+
+func TestServiceImportWatchedPersistsBatchCursorsAndWarnings(t *testing.T) {
+	repo := newServiceFakeRepo()
+	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	provider := watchedBatchImporterStub{
+		watchedImporterStub: watchedImporterStub{key: "simkl", source: userstore.WatchHistorySourceSimkl},
+		batch: WatchedImportBatch{
+			UpdatedCursors: map[string]string{"simkl.inbound.movies.completed": "2026-05-04T11:00:00Z"},
+			Warnings:       []string{"simkl removed_from_list changed; removals are not imported"},
+		},
+	}
+	service := NewService(repo, NewRegistry()).
+		WithMatcher(unmatchedMatcherStub{}).
+		WithWatchState(noOpWatchState{})
+	service.now = func() time.Time { return now }
+
+	result, err := service.ImportWatched(context.Background(), Connection{
+		ID:          "conn-1",
+		Provider:    "simkl",
+		UserID:      7,
+		ProfileID:   "profile-1",
+		SyncCursors: map[string]string{"existing": "cursor"},
+	}, ServerConfig{}, provider)
+	if err != nil {
+		t.Fatalf("ImportWatched: %v", err)
+	}
+	if len(result.Warnings) != 1 || result.Warnings[0] != "simkl removed_from_list changed; removals are not imported" {
+		t.Fatalf("warnings = %+v", result.Warnings)
+	}
+	updated := repo.connections[connectionKey("simkl", 7, "profile-1")]
+	if updated.LastInboundSyncAt == nil || !updated.LastInboundSyncAt.Equal(now) {
+		t.Fatalf("last inbound sync = %v, want %v", updated.LastInboundSyncAt, now)
+	}
+	if updated.SyncCursors["existing"] != "cursor" ||
+		updated.SyncCursors["simkl.inbound.movies.completed"] != "2026-05-04T11:00:00Z" {
+		t.Fatalf("sync cursors = %+v", updated.SyncCursors)
+	}
+}
+
+func TestServiceImportWatchedLegacyImporterStillSetsLastSyncTimestamp(t *testing.T) {
+	repo := newServiceFakeRepo()
+	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	service := NewService(repo, NewRegistry()).
+		WithMatcher(unmatchedMatcherStub{}).
+		WithWatchState(noOpWatchState{})
+	service.now = func() time.Time { return now }
+
+	_, err := service.ImportWatched(context.Background(), Connection{
+		ID:        "conn-1",
+		Provider:  "trakt",
+		UserID:    7,
+		ProfileID: "profile-1",
+	}, ServerConfig{}, watchedImporterStub{})
+	if err != nil {
+		t.Fatalf("ImportWatched: %v", err)
+	}
+	updated := repo.connections[connectionKey("trakt", 7, "profile-1")]
+	if updated.LastInboundSyncAt == nil || !updated.LastInboundSyncAt.Equal(now) {
+		t.Fatalf("last inbound sync = %v, want %v", updated.LastInboundSyncAt, now)
+	}
+	if len(updated.SyncCursors) != 0 {
+		t.Fatalf("sync cursors = %+v, want empty for legacy importer", updated.SyncCursors)
+	}
+}
+
+func TestServiceImportProgressPersistsBatchCursorsAndWarnings(t *testing.T) {
+	repo := newServiceFakeRepo()
+	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	service := NewService(repo, NewRegistry()).
+		WithMatcher(unmatchedMatcherStub{}).
+		WithUserStoreProvider(staticStoreProvider{})
+	service.now = func() time.Time { return now }
+	provider := progressBatchImporterStub{
+		batch: ProgressImportBatch{
+			UpdatedCursors: map[string]string{"simkl.progress.movies": "2026-05-04T11:30:00Z"},
+			Warnings:       []string{"simkl playback movie skipped because it has no usable external id"},
+		},
+	}
+
+	result, err := service.ImportProgress(context.Background(), Connection{
+		ID:          "conn-1",
+		Provider:    "simkl",
+		UserID:      7,
+		ProfileID:   "profile-1",
+		SyncCursors: map[string]string{"existing": "cursor"},
+	}, ServerConfig{}, provider)
+	if err != nil {
+		t.Fatalf("ImportProgress: %v", err)
+	}
+	if len(result.Warnings) != 1 || result.Warnings[0] != "simkl playback movie skipped because it has no usable external id" {
+		t.Fatalf("warnings = %+v", result.Warnings)
+	}
+	updated := repo.connections[connectionKey("simkl", 7, "profile-1")]
+	if updated.LastProgressSyncAt == nil || !updated.LastProgressSyncAt.Equal(now) {
+		t.Fatalf("last progress sync = %v, want %v", updated.LastProgressSyncAt, now)
+	}
+	if updated.SyncCursors["existing"] != "cursor" ||
+		updated.SyncCursors["simkl.progress.movies"] != "2026-05-04T11:30:00Z" {
+		t.Fatalf("sync cursors = %+v", updated.SyncCursors)
+	}
+}
+
+func TestServiceSyncConnectionPreservesConnectionUpdatesAcrossFlows(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+	if err := userdb.InitSchema(db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	if err := userdb.AddHistory(db, userstore.WatchHistoryEntry{
+		ID:              "history-1",
+		ProfileID:       "profile-1",
+		MediaItemID:     testMovieMediaID,
+		WatchedAt:       "2026-05-04T12:00:00Z",
+		DurationSeconds: 7200,
+		Completed:       true,
+		Source:          userstore.WatchHistorySourcePlayback,
+		Identity: userstore.WatchIdentity{
+			StableType:  "movie",
+			ProviderIDs: map[string]string{"tmdb": "603"},
+		},
+	}); err != nil {
+		t.Fatalf("AddHistory: %v", err)
+	}
+
+	watchedAt := time.Date(2026, 5, 4, 13, 0, 0, 0, time.UTC)
+	provider := watchedImportExportStub{
+		key:    "simkl",
+		source: userstore.WatchHistorySourceSimkl,
+		rows: []RemoteWatch{{
+			Provider:      "simkl",
+			Kind:          historyimport.KindMovie,
+			Title:         "Inception",
+			Year:          2010,
+			LastWatchedAt: &watchedAt,
+		}},
+	}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	repo := newServiceFakeRepo()
+	service := NewService(repo, reg).
+		WithMatcher(matchedMatcherStub{mediaItemID: testMovieMediaID}).
+		WithWatchState(&recordingWatchState{}).
+		WithUserStoreProvider(staticStoreProvider{store: userdb.NewSQLiteUserStore(db)})
+	now := time.Date(2026, 5, 4, 14, 0, 0, 0, time.UTC)
+	service.now = func() time.Time { return now }
+	conn := Connection{
+		ID:                   "conn-1",
+		Provider:             "simkl",
+		UserID:               7,
+		ProfileID:            "profile-1",
+		AccessToken:          testAccessToken,
+		ImportWatchedEnabled: true,
+		ExportWatchedEnabled: true,
+	}
+	repo.connections[connectionKey("simkl", 7, "profile-1")] = conn
+
+	if err := service.SyncConnection(context.Background(), conn, "scheduled"); err != nil {
+		t.Fatalf("SyncConnection: %v", err)
+	}
+	updated := repo.connections[connectionKey("simkl", 7, "profile-1")]
+	if updated.LastInboundSyncAt == nil {
+		t.Fatalf("LastInboundSyncAt was not preserved across export: %+v", updated)
+	}
+	if updated.LastOutboundSyncAt == nil {
+		t.Fatalf("LastOutboundSyncAt was not recorded: %+v", updated)
+	}
+}
+
+func TestServiceExportWatchedDrainsPendingBatches(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+	if err := userdb.InitSchema(db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	for i := range 101 {
+		id := strconv.Itoa(i)
+		if err := userdb.AddHistory(db, userstore.WatchHistoryEntry{
+			ID:              "history-" + id,
+			ProfileID:       "profile-1",
+			MediaItemID:     "movie-" + id,
+			WatchedAt:       "2026-05-04T12:00:00Z",
+			DurationSeconds: 7200,
+			Completed:       true,
+			Source:          userstore.WatchHistorySourcePlayback,
+			Identity: userstore.WatchIdentity{
+				StableType:  "movie",
+				ProviderIDs: map[string]string{"tmdb": "60" + id},
+			},
+		}); err != nil {
+			t.Fatalf("AddHistory %d: %v", i, err)
+		}
+	}
+
+	repo := newServiceFakeRepo()
+	service := NewService(repo, NewRegistry()).WithUserStoreProvider(staticStoreProvider{
+		store: userdb.NewSQLiteUserStore(db),
+	})
+	result, err := service.ExportWatched(context.Background(), Connection{
+		ID:        "conn-1",
+		Provider:  "simkl",
+		UserID:    7,
+		ProfileID: "profile-1",
+	}, ServerConfig{}, watchedImportExportStub{key: "simkl", source: userstore.WatchHistorySourceSimkl})
+	if err != nil {
+		t.Fatalf("ExportWatched: %v", err)
+	}
+	if result.Sent != 101 {
+		t.Fatalf("sent = %d, want 101 (result=%+v)", result.Sent, result)
+	}
+	for _, export := range repo.historyExports {
+		if export.Status != historyExportStatusSent {
+			t.Fatalf("history exports = %+v, want all sent", repo.historyExports)
+		}
+	}
+}
+
+func TestServiceSyncConnectionMarksRunFailedWhenExportTransportFails(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+	if err := userdb.InitSchema(db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	if err := userdb.AddHistory(db, userstore.WatchHistoryEntry{
+		ID:              "history-1",
+		ProfileID:       "profile-1",
+		MediaItemID:     testMovieMediaID,
+		WatchedAt:       "2026-05-04T12:00:00Z",
+		DurationSeconds: 7200,
+		Completed:       true,
+		Source:          userstore.WatchHistorySourcePlayback,
+		Identity: userstore.WatchIdentity{
+			StableType:  "movie",
+			ProviderIDs: map[string]string{"tmdb": "603"},
+		},
+	}); err != nil {
+		t.Fatalf("AddHistory: %v", err)
+	}
+
+	repo := newServiceFakeRepo()
+	provider := watchedExporterStub{exportErr: errors.New("provider offline")}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	service := NewService(repo, reg).WithUserStoreProvider(staticStoreProvider{
+		store: userdb.NewSQLiteUserStore(db),
+	})
+	conn := Connection{
+		ID:                   "conn-1",
+		Provider:             "trakt",
+		UserID:               7,
+		ProfileID:            "profile-1",
+		AccessToken:          testAccessToken,
+		ExportWatchedEnabled: true,
+	}
+
+	err = service.SyncConnection(context.Background(), conn, "scheduled")
+	if err == nil {
+		t.Fatal("SyncConnection error = nil, want export transport failure")
+	}
+	latest, ok, err := repo.GetLatestSyncRun(context.Background(), "conn-1")
+	if err != nil {
+		t.Fatalf("GetLatestSyncRun: %v", err)
+	}
+	if !ok || latest.Status != string(SyncRunStatusFailed) {
+		t.Fatalf("latest run = %+v, want failed run", latest)
+	}
+	if latest.Error == "" {
+		t.Fatalf("latest run error is empty: %+v", latest)
+	}
+	if len(repo.historyExports) != 1 || repo.historyExports[0].Status != historyExportStatusFailed {
+		t.Fatalf("history exports = %+v, want one failed export", repo.historyExports)
+	}
+}
+
+func TestServiceExportWatchedReturnsStatusPersistenceFailure(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer func() {
+		if closeErr := db.Close(); closeErr != nil {
+			t.Fatalf("close sqlite: %v", closeErr)
+		}
+	}()
+	if err := userdb.InitSchema(db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	if err := userdb.AddHistory(db, userstore.WatchHistoryEntry{
+		ID:              "history-1",
+		ProfileID:       "profile-1",
+		MediaItemID:     testMovieMediaID,
+		WatchedAt:       "2026-05-04T12:00:00Z",
+		DurationSeconds: 7200,
+		Completed:       true,
+		Source:          userstore.WatchHistorySourcePlayback,
+		Identity: userstore.WatchIdentity{
+			StableType:  "movie",
+			ProviderIDs: map[string]string{"tmdb": "603"},
+		},
+	}); err != nil {
+		t.Fatalf("AddHistory: %v", err)
+	}
+
+	repo := newServiceFakeRepo()
+	repo.markHistoryStatusErr = errors.New("persist failed")
+	service := NewService(repo, NewRegistry()).WithUserStoreProvider(staticStoreProvider{
+		store: userdb.NewSQLiteUserStore(db),
+	})
+	result, err := service.ExportWatched(context.Background(), Connection{
+		ID:        "conn-1",
+		Provider:  "trakt",
+		UserID:    7,
+		ProfileID: "profile-1",
+	}, ServerConfig{}, watchedExporterStub{exportErr: errors.New("provider offline")})
+	if err == nil {
+		t.Fatal("ExportWatched error = nil, want combined export and persistence failure")
+	}
+	if !strings.Contains(err.Error(), "provider offline") || !strings.Contains(err.Error(), "persist failed") {
+		t.Fatalf("error = %v", err)
+	}
+	if result.Failed != 1 {
+		t.Fatalf("result = %+v", result)
+	}
+	if len(repo.historyExports) != 1 || repo.historyExports[0].Status != historyExportStatusPending {
+		t.Fatalf("history exports = %+v", repo.historyExports)
+	}
+}
+
+func TestServiceCompletedScrobblePersistsAndSatisfiesHistoryExport(t *testing.T) {
+	repo := newServiceFakeRepo()
+	service := NewService(repo, NewRegistry())
+	conn := Connection{ID: "conn-1"}
+	event := ScrobbleEvent{
+		PlaybackSessionID: testPlaybackSessionID,
+		MediaItemID:       testEpisodeMediaID,
+		Kind:              historyimport.KindEpisode,
+		SeriesTVDBID:      "123",
+		SeasonNumber:      1,
+		EpisodeNumber:     2,
+		HistoryID:         testWatchHistoryID,
+		OccurredAt:        time.Now().UTC(),
+		Completed:         true,
+	}
+	if err := service.persistCompletedScrobbleExport(context.Background(), conn, event); err != nil {
+		t.Fatal(err)
+	}
+	if len(repo.historyExports) != 1 || repo.historyExports[0].Status != historyExportStatusPending {
+		t.Fatalf("history exports = %#v", repo.historyExports)
+	}
+	if repo.historyExports[0].ProviderItemKey != "show:tvdb:123:s1:e2" {
+		t.Fatalf("provider item key = %q", repo.historyExports[0].ProviderItemKey)
+	}
+	if err := service.dispatchScrobble(context.Background(), watchedScrobblerStub{}, ServerConfig{}, conn, event, "stop", nil); err != nil {
+		t.Fatal(err)
+	}
+	if repo.historyExports[0].Status != historyExportStatusSatisfiedByScrobble {
+		t.Fatalf("history export status = %q", repo.historyExports[0].Status)
+	}
+}
+
+func TestServiceCompletedScrobbleDurablyRetriesSatisfiedPersistenceWithoutResendingStop(t *testing.T) {
+	repo := newServiceFakeRepo()
+	repo.markSatisfiedErr = errors.New("database unavailable")
+	service := NewService(repo, NewRegistry())
+	conn := Connection{ID: "conn-1", Provider: "trakt"}
+	event := ScrobbleEvent{
+		PlaybackSessionID: testPlaybackSessionID,
+		HistoryID:         testWatchHistoryID,
+		Completed:         true,
+	}
+	repo.historyExports = []HistoryExport{{ID: testHistoryExportID, ConnectionID: conn.ID, HistoryID: event.HistoryID, Status: historyExportStatusPending}}
+	if err := service.dispatchScrobble(context.Background(), watchedScrobblerStub{}, ServerConfig{}, conn, event, "stop", nil); err == nil {
+		t.Fatal("expected reconciliation persistence failure")
+	}
+	if repo.historyExports[0].Status != historyExportStatusPending {
+		t.Fatalf("history export status = %q", repo.historyExports[0].Status)
+	}
+	updates := repo.scrobbleUpdatesSnapshot()
+	if len(updates) != 1 || updates[0].stopSentAt == nil {
+		t.Fatalf("scrobble updates = %#v", updates)
+	}
+	if len(repo.pendingReconciliations) != 1 {
+		t.Fatalf("pending reconciliations = %#v", repo.pendingReconciliations)
+	}
+	repo.markSatisfiedErr = nil
+	if err := service.SweepOpenScrobbles(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if repo.historyExports[0].Status != historyExportStatusSatisfiedByScrobble || len(repo.pendingReconciliations) != 0 {
+		t.Fatalf("history exports=%#v pending=%#v", repo.historyExports, repo.pendingReconciliations)
+	}
+	if updates = repo.scrobbleUpdatesSnapshot(); len(updates) != 1 {
+		t.Fatalf("sweeper redispatched remote stop: %#v", updates)
+	}
+}
+
+func TestServiceOrderedScrobblerDispatchesInQueueOrder(t *testing.T) {
+	repo := newServiceFakeRepo()
+	repo.scrobbleConnections = []Connection{{
+		ID:              "conn-1",
+		Provider:        "simkl",
+		UserID:          7,
+		ProfileID:       "profile-1",
+		ScrobbleEnabled: true,
+	}}
+	provider := newOrderedScrobblerStub()
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	service := NewService(repo, reg)
+	event := ScrobbleEvent{
+		PlaybackSessionID: "session-1",
+		UserID:            7,
+		ProfileID:         "profile-1",
+		Kind:              historyimport.KindMovie,
+		MediaItemID:       testMovieMediaID,
+		PositionSeconds:   10,
+		DurationSeconds:   100,
+	}
+
+	if err := service.ScrobbleStart(context.Background(), event); err != nil {
+		t.Fatalf("ScrobbleStart: %v", err)
+	}
+	if action := <-provider.started; action != "start" {
+		t.Fatalf("first dispatch = %q, want start", action)
+	}
+	if err := service.ScrobblePause(context.Background(), event); err != nil {
+		t.Fatalf("ScrobblePause: %v", err)
+	}
+	if err := service.ScrobbleStop(context.Background(), event); err != nil {
+		t.Fatalf("ScrobbleStop: %v", err)
+	}
+	select {
+	case action := <-provider.started:
+		t.Fatalf("ordered dispatch advanced to %q before start completed", action)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	provider.release <- struct{}{}
+	if action := <-provider.started; action != "pause" {
+		t.Fatalf("second dispatch = %q, want pause", action)
+	}
+	provider.release <- struct{}{}
+	if action := <-provider.started; action != "stop" {
+		t.Fatalf("third dispatch = %q, want stop", action)
+	}
+	provider.release <- struct{}{}
+	calls := provider.waitCalls(t, 3)
+	if calls[0] != "start" || calls[1] != "pause" || calls[2] != "stop" {
+		t.Fatalf("calls = %+v, want start/pause/stop", calls)
+	}
+}
+
+func TestServiceScrobbleStopKeepsSessionOpenWhenProviderStopFails(t *testing.T) {
+	repo := newServiceFakeRepo()
+	repo.scrobbleConnections = []Connection{{
+		ID:              "conn-1",
+		Provider:        "trakt",
+		UserID:          7,
+		ProfileID:       "profile-1",
+		ScrobbleEnabled: true,
+	}}
+	provider := scrobblerStub{stopErr: errors.New("stop failed")}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	service := NewService(repo, reg)
+
+	err := service.ScrobbleStop(context.Background(), ScrobbleEvent{
+		PlaybackSessionID: "playback-1",
+		UserID:            7,
+		ProfileID:         "profile-1",
+		MediaItemID:       testMovieMediaID,
+		HistoryID:         "history-1",
+		PositionSeconds:   120,
+	})
+	if err != nil {
+		t.Fatalf("ScrobbleStop: %v", err)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		updates := repo.scrobbleUpdatesSnapshot()
+		for _, update := range updates {
+			if update.lastError == "stop failed" {
+				for _, seen := range updates {
+					if seen.stopSentAt != nil {
+						t.Fatalf("stop_sent_at was set despite provider failure: %+v", updates)
+					}
+				}
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for failed stop update: %+v", updates)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestServiceConfirmedStopWaitsForProviderAndReopensFailedReplacement(t *testing.T) {
+	repo := newServiceFakeRepo()
+	repo.scrobbleConnections = []Connection{{
+		ID:              "conn-1",
+		Provider:        "trakt",
+		UserID:          7,
+		ProfileID:       "profile-1",
+		ScrobbleEnabled: true,
+	}}
+	provider := scrobblerStub{stopErr: errors.New("stop failed")}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	service := NewService(repo, reg)
+
+	err := service.ScrobbleStopConfirmed(context.Background(), ScrobbleEvent{
+		PlaybackSessionID: "playback-1",
+		UserID:            7,
+		ProfileID:         "profile-1",
+		MediaItemID:       testMovieMediaID,
+		HistoryID:         "history-1",
+		PositionSeconds:   120,
+	})
+	if err == nil || err.Error() != "stop failed" {
+		t.Fatalf("ScrobbleStopConfirmed error = %v, want stop failed", err)
+	}
+	if len(repo.reopenedScrobbles) != 1 {
+		t.Fatalf("reopened scrobbles = %+v, want one durable reopen", repo.reopenedScrobbles)
+	}
+	reopened := repo.reopenedScrobbles[0]
+	if reopened.positionSeconds != 120 || reopened.historyID != "history-1" {
+		t.Fatalf("reopened scrobble = %+v, want authoritative progress", reopened)
+	}
+	updates := repo.scrobbleUpdatesSnapshot()
+	for _, update := range updates {
+		if update.stopSentAt != nil {
+			t.Fatalf("failed confirmed stop marked session closed: %+v", updates)
+		}
+	}
+}
+
+func TestServiceConfirmedStopRetriesImmediatelyAfterProviderFailure(t *testing.T) {
+	repo := newServiceFakeRepo()
+	repo.scrobbleConnections = []Connection{{
+		ID:              "conn-1",
+		Provider:        "trakt",
+		UserID:          7,
+		ProfileID:       "profile-1",
+		ScrobbleEnabled: true,
+	}}
+	var failures atomic.Int32
+	failures.Store(1)
+	provider := scrobblerStub{
+		stopEvents:   make(chan ScrobbleEvent, 2),
+		stopFailures: &failures,
+	}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	service := NewService(repo, reg)
+	event := ScrobbleEvent{
+		PlaybackSessionID: "session-1",
+		UserID:            7,
+		ProfileID:         "profile-1",
+		MediaItemID:       testMovieMediaID,
+	}
+
+	if err := service.ScrobbleStopConfirmed(context.Background(), event); err == nil {
+		t.Fatal("first ScrobbleStopConfirmed unexpectedly succeeded")
+	}
+	if err := service.ScrobbleStopConfirmed(context.Background(), event); err != nil {
+		t.Fatalf("retry ScrobbleStopConfirmed: %v", err)
+	}
+	if len(provider.stopEvents) != 2 {
+		t.Fatalf("provider stop attempts = %d, want immediate retry", len(provider.stopEvents))
+	}
+}
+
+func TestServiceConfirmedStopWaitsInProviderOrder(t *testing.T) {
+	repo := newServiceFakeRepo()
+	repo.scrobbleConnections = []Connection{{
+		ID:              "conn-1",
+		Provider:        "simkl",
+		UserID:          7,
+		ProfileID:       "profile-1",
+		ScrobbleEnabled: true,
+	}}
+	provider := newOrderedScrobblerStub()
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	service := NewService(repo, reg)
+	event := ScrobbleEvent{
+		PlaybackSessionID: "session-1",
+		UserID:            7,
+		ProfileID:         "profile-1",
+		MediaItemID:       testMovieMediaID,
+	}
+	if err := service.ScrobbleStart(context.Background(), event); err != nil {
+		t.Fatalf("ScrobbleStart: %v", err)
+	}
+	if action := <-provider.started; action != "start" {
+		t.Fatalf("first dispatch = %q, want start", action)
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		result <- service.ScrobbleStopConfirmed(context.Background(), event)
+	}()
+	select {
+	case err := <-result:
+		t.Fatalf("confirmed stop returned before queued start completed: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	provider.release <- struct{}{}
+	if action := <-provider.started; action != "stop" {
+		t.Fatalf("second dispatch = %q, want stop", action)
+	}
+	select {
+	case err := <-result:
+		t.Fatalf("confirmed stop returned before provider completed: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	provider.release <- struct{}{}
+	if err := <-result; err != nil {
+		t.Fatalf("ScrobbleStopConfirmed: %v", err)
+	}
+}
+
+func TestServiceConfirmedStopDispatchesProvidersIndependently(t *testing.T) {
+	repo := newServiceFakeRepo()
+	repo.settings["watchsync.slow.client_id"] = "client-id"
+	repo.settings["watchsync.slow.client_secret"] = "client-secret"
+	repo.settings["watchsync.healthy.client_id"] = "client-id"
+	repo.settings["watchsync.healthy.client_secret"] = "client-secret"
+	repo.scrobbleConnections = []Connection{
+		{
+			ID:              "conn-slow",
+			Provider:        "slow",
+			UserID:          7,
+			ProfileID:       "profile-1",
+			ScrobbleEnabled: true,
+		},
+		{
+			ID:              "conn-healthy",
+			Provider:        "healthy",
+			UserID:          7,
+			ProfileID:       "profile-1",
+			ScrobbleEnabled: true,
+		},
+	}
+	slow := keyedScrobblerStub{
+		key: "slow",
+		scrobblerStub: scrobblerStub{
+			stopStarted: make(chan struct{}, 1),
+			stopRelease: make(chan struct{}),
+		},
+	}
+	healthy := keyedScrobblerStub{
+		key: "healthy",
+		scrobblerStub: scrobblerStub{
+			stopEvents: make(chan ScrobbleEvent, 1),
+		},
+	}
+	reg := NewRegistry()
+	if err := reg.Register(slow); err != nil {
+		t.Fatalf("Register slow provider: %v", err)
+	}
+	if err := reg.Register(healthy); err != nil {
+		t.Fatalf("Register healthy provider: %v", err)
+	}
+	service := NewService(repo, reg)
+	event := ScrobbleEvent{
+		PlaybackSessionID: "session-1",
+		UserID:            7,
+		ProfileID:         "profile-1",
+		MediaItemID:       testMovieMediaID,
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		result <- service.ScrobbleStopConfirmed(context.Background(), event)
+	}()
+	select {
+	case <-slow.stopStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for slow provider")
+	}
+	select {
+	case <-healthy.stopEvents:
+	case <-time.After(time.Second):
+		t.Fatal("healthy provider was starved by slow provider")
+	}
+	close(slow.stopRelease)
+	if err := <-result; err != nil {
+		t.Fatalf("ScrobbleStopConfirmed: %v", err)
+	}
+}
+
+func TestServiceConfirmedStopWaitsBehindFallbackWithoutProviderOrdering(t *testing.T) {
+	repo := newServiceFakeRepo()
+	repo.scrobbleConnections = []Connection{{
+		ID:              "conn-1",
+		Provider:        "trakt",
+		UserID:          7,
+		ProfileID:       "profile-1",
+		ScrobbleEnabled: true,
+	}}
+	provider := scrobblerStub{
+		stopStarted: make(chan struct{}, 2),
+		stopRelease: make(chan struct{}),
+	}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	service := NewService(repo, reg)
+	event := ScrobbleEvent{
+		PlaybackSessionID: "session-1",
+		UserID:            7,
+		ProfileID:         "profile-1",
+		MediaItemID:       testMovieMediaID,
+	}
+
+	if err := service.ScrobbleStop(context.Background(), event); err != nil {
+		t.Fatalf("fallback ScrobbleStop: %v", err)
+	}
+	select {
+	case <-provider.stopStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for fallback stop")
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		result <- service.ScrobbleStopConfirmed(context.Background(), event)
+	}()
+	select {
+	case <-provider.stopStarted:
+		t.Fatal("confirmed stop passed the in-flight fallback")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	provider.stopRelease <- struct{}{}
+	select {
+	case <-provider.stopStarted:
+	case <-time.After(time.Second):
+		t.Fatal("confirmed stop did not follow the fallback")
+	}
+	provider.stopRelease <- struct{}{}
+	if err := <-result; err != nil {
+		t.Fatalf("ScrobbleStopConfirmed: %v", err)
+	}
+}
+
+func TestServiceConfirmedStopDoesNotResendSuccessfulProvider(t *testing.T) {
+	repo := newServiceFakeRepo()
+	repo.scrobbleConnections = []Connection{{
+		ID:              "conn-1",
+		Provider:        "trakt",
+		UserID:          7,
+		ProfileID:       "profile-1",
+		ScrobbleEnabled: true,
+	}}
+	provider := scrobblerStub{stopEvents: make(chan ScrobbleEvent, 2)}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	service := NewService(repo, reg)
+	event := ScrobbleEvent{
+		PlaybackSessionID: "session-1",
+		UserID:            7,
+		ProfileID:         "profile-1",
+		MediaItemID:       testMovieMediaID,
+	}
+
+	if err := service.ScrobbleStopConfirmed(context.Background(), event); err != nil {
+		t.Fatalf("first ScrobbleStopConfirmed: %v", err)
+	}
+	if err := service.ScrobbleStopConfirmed(context.Background(), event); err != nil {
+		t.Fatalf("retry ScrobbleStopConfirmed: %v", err)
+	}
+	select {
+	case <-provider.stopEvents:
+	default:
+		t.Fatal("successful confirmed stop was not dispatched")
+	}
+	select {
+	case duplicate := <-provider.stopEvents:
+		t.Fatalf("successful provider received duplicate confirmed stop: %+v", duplicate)
+	default:
+	}
+	if len(repo.reopenedScrobbles) != 1 {
+		t.Fatalf("confirmed stop preparations = %+v, want one", repo.reopenedScrobbles)
+	}
+}
+
+func TestServiceConfirmedStopSerializesConcurrentConfirmation(t *testing.T) {
+	repo := newServiceFakeRepo()
+	repo.scrobbleConnections = []Connection{{
+		ID:              "conn-1",
+		Provider:        "trakt",
+		UserID:          7,
+		ProfileID:       "profile-1",
+		ScrobbleEnabled: true,
+	}}
+	provider := scrobblerStub{
+		stopStarted: make(chan struct{}, 1),
+		stopRelease: make(chan struct{}),
+	}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	service := NewService(repo, reg)
+	event := ScrobbleEvent{
+		PlaybackSessionID: "session-1",
+		UserID:            7,
+		ProfileID:         "profile-1",
+		MediaItemID:       testMovieMediaID,
+	}
+
+	firstResult := make(chan error, 1)
+	go func() {
+		firstResult <- service.ScrobbleStopConfirmed(context.Background(), event)
+	}()
+	select {
+	case <-provider.stopStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first provider stop")
+	}
+
+	secondResult := make(chan error, 1)
+	go func() {
+		secondResult <- service.ScrobbleStopConfirmed(context.Background(), event)
+	}()
+	select {
+	case err := <-secondResult:
+		t.Fatalf("concurrent confirmation returned before the first completed: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(provider.stopRelease)
+	if err := <-firstResult; err != nil {
+		t.Fatalf("first ScrobbleStopConfirmed: %v", err)
+	}
+	if err := <-secondResult; err != nil {
+		t.Fatalf("second ScrobbleStopConfirmed: %v", err)
+	}
+	select {
+	case <-provider.stopStarted:
+		t.Fatal("concurrent confirmation dispatched a duplicate provider stop")
+	default:
+	}
+}
+
+func TestServiceConfirmedStopCannotCompleteReclaimedLease(t *testing.T) {
+	repo := newServiceFakeRepo()
+	repo.scrobbleConnections = []Connection{{
+		ID:              "conn-1",
+		Provider:        "trakt",
+		UserID:          7,
+		ProfileID:       "profile-1",
+		ScrobbleEnabled: true,
+	}}
+	provider := scrobblerStub{
+		stopStarted: make(chan struct{}, 1),
+		stopRelease: make(chan struct{}),
+	}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	service := NewService(repo, reg)
+	event := ScrobbleEvent{
+		PlaybackSessionID: "session-1",
+		UserID:            7,
+		ProfileID:         "profile-1",
+		MediaItemID:       testMovieMediaID,
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		result <- service.ScrobbleStopConfirmed(context.Background(), event)
+	}()
+	select {
+	case <-provider.stopStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for provider stop")
+	}
+
+	key := event.PlaybackSessionID + "|conn-1"
+	repo.confirmingScrobbles[key] = time.Now().Add(time.Second)
+	close(provider.stopRelease)
+	if err := <-result; !errors.Is(err, errConfirmedStopClaimLost) {
+		t.Fatalf("stale ScrobbleStopConfirmed error = %v, want claim lost", err)
+	}
+	if repo.confirmedScrobbles[key] {
+		t.Fatal("stale provider worker marked the reclaimed stop confirmed")
+	}
+}
+
+func TestServiceConfirmedStopRejectsUnregisteredProvider(t *testing.T) {
+	repo := newServiceFakeRepo()
+	repo.scrobbleConnections = []Connection{{
+		ID:              "conn-1",
+		Provider:        "temporarily-unavailable",
+		UserID:          7,
+		ProfileID:       "profile-1",
+		ScrobbleEnabled: true,
+	}}
+	service := NewService(repo, NewRegistry())
+
+	err := service.ScrobbleStopConfirmed(context.Background(), ScrobbleEvent{
+		PlaybackSessionID: "session-1",
+		UserID:            7,
+		ProfileID:         "profile-1",
+		MediaItemID:       testMovieMediaID,
+	})
+	if err == nil || !strings.Contains(err.Error(), "not registered") {
+		t.Fatalf("ScrobbleStopConfirmed error = %v, want unregistered provider", err)
+	}
+}
+
+func TestServiceScrobbleRefreshesExpiredTokenBeforeDispatch(t *testing.T) {
+	repo := newServiceFakeRepo()
+	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	expiresAt := now.Add(-time.Minute)
+	refreshedExpiresAt := now.Add(time.Hour)
+	repo.scrobbleConnections = []Connection{{
+		ID:              "conn-1",
+		Provider:        "trakt",
+		UserID:          7,
+		ProfileID:       "profile-1",
+		AccessToken:     testOldAccessToken,
+		RefreshToken:    testOldRefreshToken,
+		TokenExpiresAt:  &expiresAt,
+		ScrobbleEnabled: true,
+	}}
+	provider := &scrobblerStub{
+		refreshTokens: TokenSet{
+			AccessToken:    "new-access",
+			RefreshToken:   "new-refresh",
+			TokenExpiresAt: &refreshedExpiresAt,
+		},
+		stopConns: make(chan Connection, 1),
+	}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	service := NewService(repo, reg)
+	service.now = func() time.Time { return now }
+
+	err := service.ScrobbleStop(context.Background(), ScrobbleEvent{
+		PlaybackSessionID: "playback-1",
+		UserID:            7,
+		ProfileID:         "profile-1",
+		MediaItemID:       testMovieMediaID,
+		HistoryID:         "history-1",
+		PositionSeconds:   120,
+	})
+	if err != nil {
+		t.Fatalf("ScrobbleStop: %v", err)
+	}
+	if !provider.refreshed {
+		t.Fatal("provider was not asked to refresh the expired token")
+	}
+	updated := repo.connections[connectionKey("trakt", 7, "profile-1")]
+	if updated.AccessToken != "new-access" || updated.RefreshToken != "new-refresh" {
+		t.Fatalf("stored tokens = %q/%q, want refreshed tokens", updated.AccessToken, updated.RefreshToken)
+	}
+
+	select {
+	case conn := <-provider.stopConns:
+		if conn.AccessToken != "new-access" {
+			t.Fatalf("scrobble used access token %q, want refreshed token", conn.AccessToken)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for scrobble dispatch")
+	}
+}
+
+func TestServiceSweepOpenScrobblesRetriesProviderStop(t *testing.T) {
+	repo := newServiceFakeRepo()
+	repo.connections[connectionKey("trakt", 7, "profile-1")] = Connection{
+		ID:              "conn-1",
+		Provider:        "trakt",
+		UserID:          7,
+		ProfileID:       "profile-1",
+		AccessToken:     testAccessToken,
+		ScrobbleEnabled: true,
+	}
+	repo.scrobbleSessions = []ScrobbleSession{{
+		PlaybackSessionID: "playback-1",
+		ConnectionID:      "conn-1",
+		MediaItemID:       testMovieMediaID,
+		Kind:              "movie",
+		TMDBID:            "603",
+		HistoryID:         "history-1",
+		LastProgress:      5400,
+		DurationSeconds:   7200,
+		Completed:         true,
+	}}
+	provider := scrobblerStub{stopEvents: make(chan ScrobbleEvent, 1)}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	service := NewService(repo, reg)
+	service.now = func() time.Time { return now }
+
+	if err := service.SweepOpenScrobbles(context.Background()); err != nil {
+		t.Fatalf("SweepOpenScrobbles: %v", err)
+	}
+
+	select {
+	case event := <-provider.stopEvents:
+		if event.PlaybackSessionID != "playback-1" || event.UserID != 7 || event.ProfileID != "profile-1" {
+			t.Fatalf("stop event ownership = %+v, want playback/profile context", event)
+		}
+		if event.TMDBID != "603" || event.DurationSeconds != 7200 || !event.Completed {
+			t.Fatalf("stop event media fields = %+v, want persisted event metadata", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for provider stop retry")
+	}
+	foundClosed := false
+	updates := repo.scrobbleUpdatesSnapshot()
+	for _, update := range updates {
+		if update.action == "stop" && update.stopSentAt != nil {
+			foundClosed = true
+		}
+	}
+	if !foundClosed {
+		t.Fatalf("scrobble updates = %+v, want successful stop to mark session closed", updates)
+	}
+}
+
+func TestServiceSweepOpenScrobblesKeepsFailedStopOpen(t *testing.T) {
+	repo := newServiceFakeRepo()
+	repo.connections[connectionKey("trakt", 7, "profile-1")] = Connection{
+		ID:              "conn-1",
+		Provider:        "trakt",
+		UserID:          7,
+		ProfileID:       "profile-1",
+		AccessToken:     testAccessToken,
+		ScrobbleEnabled: true,
+	}
+	repo.scrobbleSessions = []ScrobbleSession{{
+		PlaybackSessionID: "playback-1",
+		ConnectionID:      "conn-1",
+		MediaItemID:       testMovieMediaID,
+		Kind:              "movie",
+		TMDBID:            "603",
+		HistoryID:         "history-1",
+		LastProgress:      5400,
+		DurationSeconds:   7200,
+	}}
+	provider := scrobblerStub{stopErr: errors.New("provider offline")}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	service := NewService(repo, reg)
+
+	if err := service.SweepOpenScrobbles(context.Background()); err != nil {
+		t.Fatalf("SweepOpenScrobbles: %v", err)
+	}
+	updates := repo.scrobbleUpdatesSnapshot()
+	for _, update := range updates {
+		if update.stopSentAt != nil {
+			t.Fatalf("stop_sent_at was set despite provider failure: %+v", updates)
+		}
+		if update.lastError == "provider offline" {
+			return
+		}
+	}
+	t.Fatalf("scrobble updates = %+v, want provider error recorded", updates)
+}
+
+func TestAppendWarningSummarizesDuplicateReasons(t *testing.T) {
+	got := appendWarning("", []string{
+		"missing season or episode number",
+		"missing season or episode number",
+		"no tmdb_id match for \"92820\"",
+	})
+	want := "missing season or episode number (2 items); no tmdb_id match for \"92820\""
+	if got != want {
+		t.Fatalf("appendWarning() = %q, want %q", got, want)
+	}
+}
+
+type completedHistoryListerStub struct {
+	rows    []userstore.WatchHistoryEntry
+	queries []userstore.CompletedHistoryQuery
+}
+
+func (s *completedHistoryListerStub) ListCompletedHistory(_ context.Context, query userstore.CompletedHistoryQuery) ([]userstore.WatchHistoryEntry, error) {
+	s.queries = append(s.queries, query)
+	start := query.Offset
+	if start >= len(s.rows) {
+		return nil, nil
+	}
+	limit := query.Limit
+	if limit <= 0 {
+		limit = len(s.rows)
+	}
+	end := start + limit
+	if end > len(s.rows) {
+		end = len(s.rows)
+	}
+	return s.rows[start:end], nil
+}
+
+func TestHasVisibleCompletedHistoryAtOrAfterScopesTargetAndPaginates(t *testing.T) {
+	at := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	rows := make([]userstore.WatchHistoryEntry, 501)
+	for i := 0; i < 500; i++ {
+		rows[i] = userstore.WatchHistoryEntry{
+			ProfileID:   "profile-1",
+			MediaItemID: testMovieMediaID,
+			WatchedAt:   at.Add(-time.Duration(500-i) * time.Hour).Format(time.RFC3339),
+			Completed:   true,
+		}
+	}
+	rows[500] = userstore.WatchHistoryEntry{
+		ProfileID:   "profile-1",
+		MediaItemID: testMovieMediaID,
+		WatchedAt:   at.Add(time.Minute).Format(time.RFC3339),
+		Completed:   true,
+	}
+	store := &completedHistoryListerStub{rows: rows}
+
+	found, err := hasVisibleCompletedHistoryAtOrAfter(context.Background(), store, "profile-1", testMovieMediaID, at)
+	if err != nil {
+		t.Fatalf("hasVisibleCompletedHistoryAtOrAfter: %v", err)
+	}
+	if !found {
+		t.Fatal("found = false, want true")
+	}
+	if len(store.queries) != 2 {
+		t.Fatalf("query count = %d, want 2", len(store.queries))
+	}
+	for _, query := range store.queries {
+		if query.ProfileID != "profile-1" || len(query.MediaItemIDs) != 1 || query.MediaItemIDs[0] != testMovieMediaID {
+			t.Fatalf("query was not scoped to target media item: %+v", query)
+		}
+	}
+}
+
+func TestListAllCompletedHistoryPaginatesUntilExhausted(t *testing.T) {
+	rows := make([]userstore.WatchHistoryEntry, 501)
+	for i := range rows {
+		rows[i] = userstore.WatchHistoryEntry{
+			ID:          "history-" + strconv.Itoa(i),
+			ProfileID:   "profile-1",
+			MediaItemID: "movie-" + strconv.Itoa(i),
+			Completed:   true,
+		}
+	}
+	store := &completedHistoryListerStub{rows: rows}
+
+	got, err := listAllCompletedHistory(context.Background(), store, userstore.CompletedHistoryQuery{
+		ProfileID:      "profile-1",
+		ExcludeSources: []userstore.WatchHistorySource{userstore.WatchHistorySourceTrakt},
+	})
+	if err != nil {
+		t.Fatalf("listAllCompletedHistory: %v", err)
+	}
+	if len(got) != len(rows) {
+		t.Fatalf("history len = %d, want %d", len(got), len(rows))
+	}
+	if len(store.queries) != 2 {
+		t.Fatalf("query count = %d, want 2", len(store.queries))
+	}
+	if store.queries[0].Limit != completedHistoryPageSize || store.queries[0].Offset != 0 {
+		t.Fatalf("first query = %+v, want first page", store.queries[0])
+	}
+	if store.queries[1].Limit != completedHistoryPageSize || store.queries[1].Offset != completedHistoryPageSize {
+		t.Fatalf("second query = %+v, want second page", store.queries[1])
+	}
+	for _, query := range store.queries {
+		if query.ProfileID != "profile-1" || len(query.ExcludeSources) != 1 ||
+			query.ExcludeSources[0] != userstore.WatchHistorySourceTrakt {
+			t.Fatalf("query did not preserve export filters: %+v", query)
+		}
+	}
+}
+
+func TestHistorySourceForProviderDefaultsAndUsesProviderSource(t *testing.T) {
+	if got := historySourceForProvider(watchedExporterStub{source: userstore.WatchHistorySourceSimkl}); got != userstore.WatchHistorySourceSimkl {
+		t.Fatalf("historySourceForProvider(simkl) = %q, want simkl", got)
+	}
+	if got := historySourceForProvider(struct{}{}); got != userstore.WatchHistorySourceImport {
+		t.Fatalf("historySourceForProvider(no source) = %q, want import", got)
+	}
+}
+
+// rateLimitedImporterStub rate-limits watched import and records whether the
+// progress flow was still attempted afterwards.
+type rateLimitedImporterStub struct {
+	progressCalled *bool
+	fetchCalls     *int
+}
+
+func (p rateLimitedImporterStub) Key() string         { return "trakt" }
+func (p rateLimitedImporterStub) DisplayName() string { return "Trakt" }
+func (p rateLimitedImporterStub) Capabilities() Capabilities {
+	return Capabilities{ImportWatched: true, ImportProgress: true}
+}
+
+func (p rateLimitedImporterStub) FetchWatched(context.Context, ServerConfig, Connection) ([]RemoteWatch, error) {
+	if p.fetchCalls != nil {
+		*p.fetchCalls++
+	}
+	return nil, RateLimitedError{Provider: "trakt", RetryAfter: 30 * time.Minute}
+}
+
+func (p rateLimitedImporterStub) FetchProgress(context.Context, ServerConfig, Connection) ([]RemoteProgress, error) {
+	*p.progressCalled = true
+	return nil, nil
+}
+
+func (p rateLimitedImporterStub) HistorySource() userstore.WatchHistorySource {
+	return userstore.WatchHistorySourceTrakt
+}
+
+func TestServicePluginAPIKeyConnectRejectsEmptyReturnedCredential(t *testing.T) {
+	repo := newServiceFakeRepo()
+	registry := NewRegistry()
+	provider := emptyPluginAPIKeyProvider{}
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(repo, registry)
+	if _, err := service.ConnectAPIKey(context.Background(), 7, "profile-1", provider.Key(), "input-secret"); err == nil {
+		t.Fatal("ConnectAPIKey error = nil")
+	}
+	if len(repo.connections) != 0 {
+		t.Fatalf("connections = %#v", repo.connections)
+	}
+}
+
+func TestServicePluginAPIKeyReconnectClearsConnectionError(t *testing.T) {
+	repo := newServiceFakeRepo()
+	client := &fakeWatchSyncPluginClient{exchangeResponse: &pluginv1.WatchSyncCredentialResponse{
+		Credentials: &pluginv1.WatchSyncCredentials{AccessToken: "new-access", TokenType: testBearerTokenType},
+		Account:     &pluginv1.WatchSyncAccount{ExternalSubject: "account-1", Username: testPluginUsername},
+	}}
+	provider := testPluginProvider(t, client)
+	registry := NewRegistry()
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	conn := Connection{
+		ID:        "conn-1",
+		Provider:  provider.Key(),
+		UserID:    7,
+		ProfileID: "profile-1",
+		LastError: testReconnectRequired,
+	}
+	repo.connections[connectionKey(conn.Provider, conn.UserID, conn.ProfileID)] = conn
+
+	updated, err := NewService(repo, registry).ConnectAPIKey(context.Background(), conn.UserID, conn.ProfileID, provider.Key(), "replacement-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.AccessToken != "new-access" || updated.LastError != "" {
+		t.Fatalf("connection = %#v", updated)
+	}
+}
+
+func TestServiceSyncConnectionDefersOnRateLimit(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+	if err := userdb.InitSchema(db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+
+	repo := newServiceFakeRepo()
+	progressCalled := false
+	provider := rateLimitedImporterStub{progressCalled: &progressCalled}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	now := time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC)
+	service := NewService(repo, reg).
+		WithMatcher(matchedMatcherStub{mediaItemID: testMovieMediaID}).
+		WithWatchState(noOpWatchState{}).
+		WithUserStoreProvider(staticStoreProvider{store: userdb.NewSQLiteUserStore(db)})
+	service.now = func() time.Time { return now }
+	conn := Connection{
+		ID:                    "conn-1",
+		Provider:              "trakt",
+		UserID:                7,
+		ProfileID:             "profile-1",
+		AccessToken:           testAccessToken,
+		ImportWatchedEnabled:  true,
+		ImportProgressEnabled: true,
+	}
+	repo.connections[connectionKey("trakt", 7, "profile-1")] = conn
+
+	err = service.SyncConnection(context.Background(), conn, "scheduled")
+	if err == nil {
+		t.Fatal("SyncConnection error = nil, want rate limit failure")
+	}
+	if progressCalled {
+		t.Fatal("progress import ran after the watched import was rate limited")
+	}
+	updated := repo.connections[connectionKey("trakt", 7, "profile-1")]
+	wantUntil := now.Add(30 * time.Minute)
+	if updated.RateLimitedUntil == nil || !updated.RateLimitedUntil.Equal(wantUntil) {
+		t.Fatalf("RateLimitedUntil = %v, want %v", updated.RateLimitedUntil, wantUntil)
+	}
+	if !strings.Contains(updated.LastError, "rate limit") {
+		t.Fatalf("LastError = %q, want rate limit message", updated.LastError)
+	}
+
+	// A manual sync during the deferral must be refused with the remaining wait.
+	_, err = service.RequestManualSync(context.Background(), 7, "profile-1", "trakt")
+	var cooldown SyncCooldownError
+	if !errors.As(err, &cooldown) {
+		t.Fatalf("RequestManualSync error = %v, want SyncCooldownError", err)
+	}
+	if cooldown.RetryAfterSeconds != 30*60 {
+		t.Fatalf("RetryAfterSeconds = %d, want %d", cooldown.RetryAfterSeconds, 30*60)
+	}
+}
+
+func TestServiceLocalWatchEventCommitsPartialResultAndDefersRateLimit(t *testing.T) {
+	repo := newServiceFakeRepo()
+	provider := watchedExporterStub{
+		exportErr:    RateLimitedError{Provider: "trakt", RetryAfter: 72 * time.Hour},
+		exportResult: ExportResult{Sent: []string{"history-1"}},
+	}
+	registry := NewRegistry()
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	service := NewService(repo, registry)
+	service.now = func() time.Time { return now }
+	conn := Connection{
+		ID:                   "conn-1",
+		Provider:             "trakt",
+		UserID:               7,
+		ProfileID:            "profile-1",
+		ProviderAccountID:    testProviderAccountID,
+		ExportWatchedEnabled: true,
+	}
+	repo.connections[connectionKey(conn.Provider, conn.UserID, conn.ProfileID)] = conn
+
+	if err := service.processLocalWatchEvent(context.Background(), LocalWatchEvent{
+		Kind:      LocalWatchEventMarkedWatched,
+		UserID:    conn.UserID,
+		ProfileID: conn.ProfileID,
+		Plays: []LocalPlay{{
+			HistoryID:       "history-1",
+			MediaItemID:     testMovieMediaID,
+			ProviderItemKey: testMovieProviderItemKey,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(repo.historyExports) != 1 || repo.historyExports[0].Status != historyExportStatusSent {
+		t.Fatalf("history exports = %#v", repo.historyExports)
+	}
+	updated := repo.connections[connectionKey(conn.Provider, conn.UserID, conn.ProfileID)]
+	wantUntil := now.Add(24 * time.Hour)
+	if updated.RateLimitedUntil == nil || !updated.RateLimitedUntil.Equal(wantUntil) {
+		t.Fatalf("RateLimitedUntil = %v, want %v", updated.RateLimitedUntil, wantUntil)
+	}
+}
+
+func TestServicePluginTransportFailureLeavesExportPending(t *testing.T) {
+	repo := newServiceFakeRepo()
+	service := NewService(repo, NewRegistry())
+	conn := Connection{ID: "conn-1"}
+	err := service.exportLocalPlays(context.Background(), conn, ServerConfig{}, watchedExporterStub{
+		exportErr: retryableProviderError{message: "watch sync plugin is unavailable"},
+	}, []LocalPlay{{
+		HistoryID:       "history-1",
+		MediaItemID:     testMovieMediaID,
+		ProviderItemKey: testMovieProviderItemKey,
+	}})
+	if !isRetryableProviderError(err) {
+		t.Fatalf("error = %#v", err)
+	}
+	if len(repo.historyExports) != 1 || repo.historyExports[0].Status != historyExportStatusPending || repo.historyExports[0].AttemptCount != 0 {
+		t.Fatalf("history exports = %#v", repo.historyExports)
+	}
+}
+
+func TestServicePluginInvalidCredentialLeavesExportPendingAndRecordsConnectionError(t *testing.T) {
+	repo := newServiceFakeRepo()
+	client := &fakeWatchSyncPluginClient{applyResponse: &pluginv1.WatchSyncApplyEventsResponse{
+		Fault: &pluginv1.WatchSyncFault{
+			Code:        pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_INVALID_CREDENTIAL,
+			SafeMessage: "credential revoked",
+		},
+	}}
+	provider := testPluginProvider(t, client)
+	registry := NewRegistry()
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(repo, registry)
+	conn := Connection{
+		ID:                   "conn-1",
+		Provider:             provider.Key(),
+		UserID:               7,
+		ProfileID:            "profile-1",
+		AccessToken:          testSecretValue,
+		ExportWatchedEnabled: true,
+	}
+	repo.connections[connectionKey(conn.Provider, conn.UserID, conn.ProfileID)] = conn
+	err := service.processLocalWatchEvent(context.Background(), LocalWatchEvent{
+		Kind:      LocalWatchEventMarkedWatched,
+		UserID:    conn.UserID,
+		ProfileID: conn.ProfileID,
+		Plays: []LocalPlay{{
+			HistoryID:       "history-1",
+			MediaItemID:     testMovieMediaID,
+			ProviderItemKey: testMovieProviderItemKey,
+			Kind:            historyimport.KindMovie,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repo.historyExports) != 1 || repo.historyExports[0].Status != historyExportStatusPending || repo.historyExports[0].AttemptCount != 0 {
+		t.Fatalf("history exports = %#v", repo.historyExports)
+	}
+	updated := repo.connections[connectionKey(conn.Provider, conn.UserID, conn.ProfileID)]
+	if updated.LastError != "credential revoked" {
+		t.Fatalf("LastError = %q", updated.LastError)
+	}
+}
+
+func TestServiceExportLocalPlaysReturnsStatusPersistenceFailure(t *testing.T) {
+	repo := newServiceFakeRepo()
+	repo.markHistoryStatusErr = errors.New("persist failed")
+	service := NewService(repo, NewRegistry())
+	conn := Connection{ID: "conn-1"}
+	err := service.exportLocalPlays(context.Background(), conn, ServerConfig{}, watchedExporterStub{
+		exportErr: errors.New("provider offline"),
+	}, []LocalPlay{{
+		HistoryID:       "history-1",
+		MediaItemID:     testMovieMediaID,
+		ProviderItemKey: testMovieProviderItemKey,
+	}})
+	if err == nil {
+		t.Fatal("exportLocalPlays error = nil, want combined export and persistence failure")
+	}
+	if !strings.Contains(err.Error(), "provider offline") || !strings.Contains(err.Error(), "persist failed") {
+		t.Fatalf("error = %v", err)
+	}
+	if len(repo.historyExports) != 1 || repo.historyExports[0].Status != historyExportStatusPending || repo.historyExports[0].AttemptCount != 0 {
+		t.Fatalf("history exports = %#v", repo.historyExports)
+	}
+}
+
+func TestServiceFakeRepoMarkHistoryExportSatisfiedByScrobbleSkipsSent(t *testing.T) {
+	repo := newServiceFakeRepo()
+	repo.historyExports = []HistoryExport{{
+		ID:           testHistoryExportID,
+		ConnectionID: "conn-1",
+		HistoryID:    "history-1",
+		Status:       historyExportStatusSent,
+	}}
+	if err := repo.MarkHistoryExportSatisfiedByScrobble(context.Background(), "conn-1", "history-1"); err != nil {
+		t.Fatal(err)
+	}
+	if repo.historyExports[0].Status != historyExportStatusSent {
+		t.Fatalf("history exports = %#v", repo.historyExports)
+	}
+}
+
+func TestServiceFakeRepoPreservesNotFoundHistoryExport(t *testing.T) {
+	repo := newServiceFakeRepo()
+	repo.historyExports = []HistoryExport{{
+		ID:           testHistoryExportID,
+		ConnectionID: "conn-1",
+		HistoryID:    "history-1",
+		Status:       historyExportStatusNotFound,
+	}}
+	if err := repo.UpsertHistoryExports(context.Background(), []HistoryExport{{
+		ConnectionID: "conn-1",
+		HistoryID:    "history-1",
+		Status:       historyExportStatusPending,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.MarkHistoryExportStatus(context.Background(), testHistoryExportID, historyExportStatusFailed, "retry"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.MarkHistoryExportSatisfiedByScrobble(context.Background(), "conn-1", "history-1"); err != nil {
+		t.Fatal(err)
+	}
+	if repo.historyExports[0].Status != historyExportStatusNotFound || repo.historyExports[0].AttemptCount != 0 {
+		t.Fatalf("history exports = %#v", repo.historyExports)
+	}
+}
+
+func TestServiceScrobbleRateLimitDefersConnection(t *testing.T) {
+	repo := newServiceFakeRepo()
+	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	service := NewService(repo, NewRegistry())
+	service.now = func() time.Time { return now }
+	conn := Connection{
+		ID:                "conn-1",
+		Provider:          "trakt",
+		UserID:            7,
+		ProfileID:         "profile-1",
+		ProviderAccountID: testProviderAccountID,
+	}
+	repo.connections[connectionKey(conn.Provider, conn.UserID, conn.ProfileID)] = conn
+	err := service.dispatchScrobble(
+		context.Background(),
+		scrobblerStub{stopErr: RateLimitedError{Provider: conn.Provider, RetryAfter: 30 * time.Minute}},
+		ServerConfig{}, conn,
+		ScrobbleEvent{PlaybackSessionID: testPlaybackSessionID},
+		scrobbleActionStop,
+		nil,
+	)
+	if _, ok := AsRateLimited(err); !ok {
+		t.Fatalf("error = %#v", err)
+	}
+	updated := repo.connections[connectionKey(conn.Provider, conn.UserID, conn.ProfileID)]
+	wantUntil := now.Add(30 * time.Minute)
+	if updated.RateLimitedUntil == nil || !updated.RateLimitedUntil.Equal(wantUntil) {
+		t.Fatalf("RateLimitedUntil = %v, want %v", updated.RateLimitedUntil, wantUntil)
+	}
+}
+
+func TestServiceScrobbleInvalidCredentialRecordsConnectionError(t *testing.T) {
+	repo := newServiceFakeRepo()
+	service := NewService(repo, NewRegistry())
+	conn := Connection{
+		ID:        "conn-1",
+		Provider:  "plugin:15:probe",
+		UserID:    7,
+		ProfileID: "profile-1",
+	}
+	repo.connections[connectionKey(conn.Provider, conn.UserID, conn.ProfileID)] = conn
+	fault := watchSyncProviderFaultError{
+		code:    pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_INVALID_CREDENTIAL,
+		message: testReconnectRequired,
+	}
+	err := service.dispatchScrobble(
+		context.Background(), scrobblerStub{stopErr: fault}, ServerConfig{}, conn,
+		ScrobbleEvent{PlaybackSessionID: testPlaybackSessionID}, scrobbleActionStop, nil,
+	)
+	if !isWatchSyncInvalidCredentialError(err) {
+		t.Fatalf("error = %#v", err)
+	}
+	updated := repo.connections[connectionKey(conn.Provider, conn.UserID, conn.ProfileID)]
+	if updated.LastError != fault.Error() {
+		t.Fatalf("LastError = %q, want %q", updated.LastError, fault.Error())
+	}
+}
+
+func TestServiceSyncConnectionLeavesExportsPendingOnRateLimit(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+	if err := userdb.InitSchema(db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	if err := userdb.AddHistory(db, userstore.WatchHistoryEntry{
+		ID:              "history-1",
+		ProfileID:       "profile-1",
+		MediaItemID:     testMovieMediaID,
+		WatchedAt:       "2026-05-04T12:00:00Z",
+		DurationSeconds: 7200,
+		Completed:       true,
+		Source:          userstore.WatchHistorySourcePlayback,
+		Identity: userstore.WatchIdentity{
+			StableType:  "movie",
+			ProviderIDs: map[string]string{"tmdb": "603"},
+		},
+	}); err != nil {
+		t.Fatalf("AddHistory: %v", err)
+	}
+
+	repo := newServiceFakeRepo()
+	provider := watchedExporterStub{exportErr: RateLimitedError{Provider: "trakt", RetryAfter: time.Hour}}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	service := NewService(repo, reg).WithUserStoreProvider(staticStoreProvider{
+		store: userdb.NewSQLiteUserStore(db),
+	})
+	conn := Connection{
+		ID:                   "conn-1",
+		Provider:             "trakt",
+		UserID:               7,
+		ProfileID:            "profile-1",
+		AccessToken:          testAccessToken,
+		ExportWatchedEnabled: true,
+	}
+	repo.connections[connectionKey("trakt", 7, "profile-1")] = conn
+
+	if err := service.SyncConnection(context.Background(), conn, "scheduled"); err == nil {
+		t.Fatal("SyncConnection error = nil, want rate limit failure")
+	}
+	if len(repo.historyExports) != 1 || repo.historyExports[0].Status != historyExportStatusPending {
+		t.Fatalf("history exports = %+v, want one still-pending export", repo.historyExports)
+	}
+	updated := repo.connections[connectionKey("trakt", 7, "profile-1")]
+	if updated.RateLimitedUntil == nil {
+		t.Fatal("RateLimitedUntil not set after rate-limited export")
+	}
+}
+
+func TestSyncDueConnectionsSkipsSiblingsOfRateLimitedAccount(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+	if err := userdb.InitSchema(db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+
+	repo := newServiceFakeRepo()
+	fetchCalls := 0
+	progressCalled := false
+	provider := rateLimitedImporterStub{progressCalled: &progressCalled, fetchCalls: &fetchCalls}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	now := time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC)
+	service := NewService(repo, reg).
+		WithMatcher(matchedMatcherStub{mediaItemID: testMovieMediaID}).
+		WithWatchState(noOpWatchState{}).
+		WithUserStoreProvider(staticStoreProvider{store: userdb.NewSQLiteUserStore(db)})
+	service.now = func() time.Time { return now }
+
+	// Two household profiles share one MDBList-style API key (same provider
+	// account); the second must not sync after the first exhausts the quota.
+	first := Connection{
+		ID:                   "conn-1",
+		Provider:             "trakt",
+		UserID:               7,
+		ProfileID:            "profile-1",
+		ProviderAccountID:    "acct-1",
+		AccessToken:          testAccessToken,
+		ImportWatchedEnabled: true,
+	}
+	second := Connection{
+		ID:                   "conn-2",
+		Provider:             "trakt",
+		UserID:               7,
+		ProfileID:            "profile-2",
+		ProviderAccountID:    "acct-1",
+		AccessToken:          testAccessToken,
+		ImportWatchedEnabled: true,
+	}
+	repo.connections[connectionKey("trakt", 7, "profile-1")] = first
+	repo.connections[connectionKey("trakt", 7, "profile-2")] = second
+	repo.dueConnections = []Connection{first, second}
+
+	if err := service.SyncDueConnections(context.Background()); err != nil {
+		t.Fatalf("SyncDueConnections: %v", err)
+	}
+	if fetchCalls != 1 {
+		t.Fatalf("fetch calls = %d, want 1 (sibling connection must be skipped)", fetchCalls)
+	}
+	sibling := repo.connections[connectionKey("trakt", 7, "profile-2")]
+	wantUntil := now.Add(30 * time.Minute)
+	if sibling.RateLimitedUntil == nil || !sibling.RateLimitedUntil.Equal(wantUntil) {
+		t.Fatalf("sibling RateLimitedUntil = %v, want %v", sibling.RateLimitedUntil, wantUntil)
+	}
+}
+
+type favoriteBatchProviderStub struct {
+	batch FavoriteImportBatch
+}
+
+func (favoriteBatchProviderStub) Key() string         { return "plugin:4:list" }
+func (favoriteBatchProviderStub) DisplayName() string { return "List" }
+func (favoriteBatchProviderStub) Capabilities() Capabilities {
+	return Capabilities{ImportFavorites: true}
+}
+func (p favoriteBatchProviderStub) FetchFavorites(context.Context, ServerConfig, Connection) ([]RemoteFavorite, error) {
+	return p.batch.Rows, nil
+}
+func (p favoriteBatchProviderStub) FetchFavoritesBatch(context.Context, ServerConfig, Connection) (FavoriteImportBatch, error) {
+	return p.batch, nil
+}
+
+func TestServiceAppliesIncrementalFavoriteTombstone(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := userdb.InitSchema(db); err != nil {
+		t.Fatal(err)
+	}
+	store := userdb.NewSQLiteUserStore(db)
+	ctx := context.Background()
+	if _, err := store.AddFavoriteAt(ctx, "profile-1", testMovieMediaID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	repo := newServiceFakeRepo()
+	conn := Connection{
+		ID: "conn-1", Provider: "plugin:4:list", UserID: 7, ProfileID: "profile-1",
+		ImportFavoritesEnabled: true, SyncFavoriteRemovalsEnabled: true,
+	}
+	repo.listItemStates = []ListItemState{{
+		ConnectionID: conn.ID, ListKind: ListKindFavorites, MediaItemID: testMovieMediaID,
+		ProviderItemKey: testMovieProviderItemKey, RemotePresent: true, LocalPresent: true,
+	}}
+	service := NewService(repo, NewRegistry()).
+		WithMatcher(matchedMatcherStub{mediaItemID: testMovieMediaID}).
+		WithUserStoreProvider(staticStoreProvider{store: store})
+	provider := favoriteBatchProviderStub{batch: FavoriteImportBatch{
+		Rows:           []RemoteFavorite{{ProviderItemKey: testMovieProviderItemKey, Removed: true}},
+		UpdatedCursors: map[string]string{pluginFavoritesCursorKey: "cursor-2"},
+		Incremental:    true,
+	}}
+	result, err := service.importList(ctx, conn, ServerConfig{}, provider, service.favoritesBinding())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Removed != 1 {
+		t.Fatalf("result = %#v", result)
+	}
+	favorites, err := store.ListFavorites(ctx, conn.ProfileID, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(favorites) != 0 || repo.listItemStates[0].RemotePresent || repo.listItemStates[0].LocalPresent {
+		t.Fatalf("favorites=%#v state=%#v", favorites, repo.listItemStates[0])
+	}
+	updated := repo.connections[connectionKey(conn.Provider, conn.UserID, conn.ProfileID)]
+	if updated.SyncCursors[pluginFavoritesCursorKey] != "cursor-2" {
+		t.Fatalf("connection cursors = %#v", updated.SyncCursors)
+	}
+}
+
+func TestServiceIncrementalFavoriteAbsenceIsNotRemoval(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := userdb.InitSchema(db); err != nil {
+		t.Fatal(err)
+	}
+	store := userdb.NewSQLiteUserStore(db)
+	ctx := context.Background()
+	if _, err := store.AddFavoriteAt(ctx, "profile-1", testMovieMediaID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	repo := newServiceFakeRepo()
+	conn := Connection{
+		ID: "conn-1", Provider: "plugin:4:list", UserID: 7, ProfileID: "profile-1",
+		ImportFavoritesEnabled: true, SyncFavoriteRemovalsEnabled: true,
+	}
+	repo.listItemStates = []ListItemState{{
+		ConnectionID: conn.ID, ListKind: ListKindFavorites, MediaItemID: testMovieMediaID,
+		ProviderItemKey: testMovieProviderItemKey, RemotePresent: true, LocalPresent: true,
+	}}
+	service := NewService(repo, NewRegistry()).
+		WithMatcher(matchedMatcherStub{mediaItemID: testMovieMediaID}).
+		WithUserStoreProvider(staticStoreProvider{store: store})
+	provider := favoriteBatchProviderStub{batch: FavoriteImportBatch{Incremental: true}}
+	result, err := service.importList(ctx, conn, ServerConfig{}, provider, service.favoritesBinding())
+	if err != nil {
+		t.Fatal(err)
+	}
+	favorites, err := store.ListFavorites(ctx, conn.ProfileID, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Removed != 0 || len(favorites) != 1 || !repo.listItemStates[0].RemotePresent || !repo.listItemStates[0].LocalPresent {
+		t.Fatalf("result=%#v favorites=%#v state=%#v", result, favorites, repo.listItemStates[0])
+	}
+}

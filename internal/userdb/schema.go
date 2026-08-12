@@ -1,0 +1,914 @@
+// Package userdb provides per-user SQLite database management for Silo.
+// Each user gets their own SQLite file storing profiles, watch progress,
+// favorites, collections, playback sessions, and settings.
+package userdb
+
+import (
+	"database/sql"
+	"fmt"
+)
+
+// Schema is the full SQLite schema for per-user databases.
+const Schema = `
+CREATE TABLE IF NOT EXISTS profiles (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    avatar TEXT,
+    pin_hash TEXT,
+    is_child BOOLEAN DEFAULT false,
+    is_primary BOOLEAN NOT NULL DEFAULT false,
+    max_content_rating TEXT,
+    quality_preference TEXT DEFAULT '1080p',
+    language TEXT DEFAULT 'en',
+    subtitle_language TEXT,
+    subtitle_mode TEXT DEFAULT 'auto',
+    auto_skip_intro BOOLEAN DEFAULT false,
+    auto_skip_credits BOOLEAN DEFAULT false,
+    auto_skip_recap BOOLEAN DEFAULT false,
+    auto_play_next_preview BOOLEAN DEFAULT false,
+    show_forced_subtitles BOOLEAN NOT NULL DEFAULT true,
+    library_restrictions_enabled BOOLEAN DEFAULT false,
+    max_playback_quality TEXT DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS profile_allowed_libraries (
+    profile_id TEXT NOT NULL,
+    library_id INTEGER NOT NULL,
+    PRIMARY KEY (profile_id, library_id)
+);
+
+CREATE TABLE IF NOT EXISTS watch_progress (
+    profile_id TEXT NOT NULL,
+    media_item_id TEXT NOT NULL,
+    position_seconds REAL NOT NULL,
+    duration_seconds REAL NOT NULL,
+    completed BOOLEAN DEFAULT false,
+    updated_at TEXT NOT NULL,
+    event_at TEXT,
+    synced_seq INTEGER,
+    last_file_id INTEGER,
+    last_resolution TEXT,
+    last_hdr BOOLEAN,
+    last_codec_video TEXT,
+    last_edition_key TEXT,
+    PRIMARY KEY (profile_id, media_item_id)
+);
+
+CREATE TABLE IF NOT EXISTS watch_history (
+    id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL,
+    media_item_id TEXT NOT NULL,
+    watched_at TEXT NOT NULL,
+    duration_seconds REAL,
+    completed BOOLEAN DEFAULT false,
+    source TEXT NOT NULL DEFAULT 'legacy',
+    watch_identity TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS hidden_history_items (
+    profile_id TEXT NOT NULL,
+    media_item_id TEXT NOT NULL,
+    hidden_before TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (profile_id, media_item_id)
+);
+
+CREATE TABLE IF NOT EXISTS playback_sessions (
+    session_id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL,
+    media_file_id INTEGER NOT NULL,
+    play_method TEXT NOT NULL,
+    position_seconds REAL DEFAULT 0,
+    is_paused BOOLEAN DEFAULT false,
+    started_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS favorites (
+    profile_id TEXT NOT NULL,
+    media_item_id TEXT NOT NULL,
+    added_at TEXT NOT NULL,
+    PRIMARY KEY (profile_id, media_item_id)
+);
+
+CREATE TABLE IF NOT EXISTS watchlist (
+    profile_id TEXT NOT NULL,
+    media_item_id TEXT NOT NULL,
+    added_at TEXT NOT NULL,
+    sort_index INTEGER,
+    PRIMARY KEY (profile_id, media_item_id)
+);
+
+CREATE TABLE IF NOT EXISTS home_item_dismissals (
+    profile_id TEXT NOT NULL,
+    surface TEXT NOT NULL,
+    media_item_id TEXT NOT NULL,
+    series_id TEXT,
+    progress_updated_at TEXT,
+    dismissed_at TEXT NOT NULL,
+    PRIMARY KEY (profile_id, surface, media_item_id)
+);
+
+CREATE TABLE IF NOT EXISTS personal_collections (
+    id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL,
+    creator_profile_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    collection_type TEXT NOT NULL DEFAULT 'manual',
+    is_shared BOOLEAN DEFAULT false,
+    query_definition TEXT NOT NULL DEFAULT '{}',
+    sort_config TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS personal_collection_items (
+    collection_id TEXT NOT NULL,
+    media_item_id TEXT NOT NULL,
+    position INTEGER,
+    added_at TEXT NOT NULL,
+    PRIMARY KEY (collection_id, media_item_id)
+);
+
+CREATE TABLE IF NOT EXISTS personal_collection_profiles (
+    collection_id TEXT NOT NULL,
+    profile_id TEXT NOT NULL,
+    PRIMARY KEY (collection_id, profile_id)
+);
+
+CREATE TABLE IF NOT EXISTS subtitle_preferences (
+    profile_id TEXT NOT NULL,
+    series_id TEXT NOT NULL,
+    subtitle_language TEXT,
+    subtitle_track_index INT,
+    external_subtitle_path TEXT,
+    subtitle_mode TEXT,
+    subtitle_track_signature TEXT NOT NULL DEFAULT '{}',
+    show_forced_subtitles BOOLEAN,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (profile_id, series_id)
+);
+
+CREATE TABLE IF NOT EXISTS audio_preferences (
+    profile_id TEXT NOT NULL,
+    series_id TEXT NOT NULL,
+    audio_track_index INT,
+    audio_language TEXT,
+    audio_track_signature TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (profile_id, series_id)
+);
+
+CREATE TABLE IF NOT EXISTS series_playback_preferences (
+    profile_id TEXT NOT NULL,
+    series_id TEXT NOT NULL,
+    resolution TEXT,
+    hdr BOOLEAN NOT NULL DEFAULT false,
+    codec_video TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (profile_id, series_id)
+);
+
+CREATE TABLE IF NOT EXISTS library_playback_preferences (
+    profile_id TEXT NOT NULL,
+    library_id INTEGER NOT NULL,
+    audio_language TEXT,
+    subtitle_language TEXT,
+    subtitle_mode TEXT,
+    show_forced_subtitles BOOLEAN,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (profile_id, library_id)
+);
+
+CREATE TABLE IF NOT EXISTS profile_onboarding (
+    profile_id TEXT NOT NULL,
+    tour_id TEXT NOT NULL,
+    last_step TEXT NOT NULL DEFAULT '',
+    completed_at TEXT,
+    skipped_at TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (profile_id, tour_id)
+);
+
+CREATE TABLE IF NOT EXISTS user_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS user_device_settings (
+    profile_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    device_name TEXT NOT NULL DEFAULT '',
+    device_platform TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (profile_id, device_id, key)
+);
+
+CREATE TABLE IF NOT EXISTS user_devices (
+    profile_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    device_name TEXT NOT NULL DEFAULT '',
+    device_platform TEXT NOT NULL DEFAULT '',
+    last_seen_at TEXT NOT NULL,
+    PRIMARY KEY (profile_id, device_id)
+);
+
+CREATE TABLE IF NOT EXISTS downloads (
+    id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL,
+    media_item_id TEXT NOT NULL,
+    media_file_id INTEGER NOT NULL,
+    quality TEXT,
+    transcoded BOOLEAN DEFAULT false,
+    file_size INTEGER,
+    expires_at TEXT,
+    downloaded_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS profile_section_overrides (
+    id                TEXT    PRIMARY KEY,
+    profile_id        TEXT    NOT NULL,
+    scope             TEXT    NOT NULL CHECK (scope IN ('home', 'library')),
+    library_id        TEXT,
+    section_id        TEXT,
+    position          INTEGER,
+    hidden            INTEGER NOT NULL DEFAULT 0,
+    removed           INTEGER NOT NULL DEFAULT 0,
+    section_type      TEXT,
+    title             TEXT,
+    featured          INTEGER,
+    item_limit        INTEGER,
+    config            TEXT,
+    is_user_added     INTEGER NOT NULL DEFAULT 0,
+    user_section_type TEXT,
+    user_config       TEXT,
+    user_title        TEXT,
+    created_at        TEXT    NOT NULL,
+    updated_at        TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_profile_section_overrides_lookup
+    ON profile_section_overrides(profile_id, scope, library_id);
+
+CREATE INDEX IF NOT EXISTS idx_profile_allowed_libraries_lookup
+    ON profile_allowed_libraries(profile_id);
+
+CREATE INDEX IF NOT EXISTS idx_personal_collection_profiles_lookup
+    ON personal_collection_profiles(profile_id, collection_id);
+
+CREATE INDEX IF NOT EXISTS idx_home_item_dismissals_lookup
+    ON home_item_dismissals(profile_id, surface);
+
+CREATE INDEX IF NOT EXISTS idx_hidden_history_items_lookup
+    ON hidden_history_items(profile_id, hidden_before);
+` + settingContractSchema + jellycompatDisplayPrefsSchema
+
+// jellycompatDisplayPrefsSchema is the dedicated home for Jellyfin
+// DisplayPreferences blobs, which used to ride user_settings under synthetic
+// jellycompat:* keys. It mirrors the PostgreSQL table in
+// migrations/sql (jellycompat_displayprefs) with user_id omitted: this
+// database is already scoped to one user. The value is opaque Jellyfin client
+// JSON stored verbatim, so it is TEXT with no json_valid CHECK — this table
+// stores what the client sent, it does not interpret it.
+const jellycompatDisplayPrefsSchema = `
+CREATE TABLE IF NOT EXISTS jellycompat_displayprefs (
+    prefs_id   TEXT NOT NULL,
+    client     TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (prefs_id, client)
+);
+`
+
+// settingContractSchema is the per-user half of the canonical settings contract
+// storage. It mirrors the PostgreSQL shape in
+// migrations/sql/20260727010621_user_setting_values.sql with user_id omitted:
+// this database is already scoped to one user. jsonb becomes TEXT plus a
+// json_valid CHECK, bigserial becomes INTEGER PRIMARY KEY AUTOINCREMENT, and
+// timestamptz becomes an RFC3339 TEXT column, matching the rest of this schema.
+//
+// This file declares no foreign keys, deliberately and consistently with every
+// other table here, so deleting a profile, library, series or device removes
+// these rows through the owning delete path rather than a cascade. The userstore
+// conformance suite holds both backends to identical behavior there.
+const settingContractSchema = `
+CREATE TABLE IF NOT EXISTS user_setting_values (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    key         TEXT NOT NULL,
+    scope       TEXT NOT NULL,
+    profile_id  TEXT,
+    client_family TEXT,
+    device_id   TEXT,
+    library_id  INTEGER,
+    series_id   TEXT,
+    value       TEXT NOT NULL CHECK (json_valid(value)),
+    revision    INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    CHECK (scope IN ('account', 'profile', 'profile_client', 'profile_device', 'profile_library', 'profile_series')),
+    CHECK (client_family IS NULL OR client_family IN ('tv', 'mobile', 'tablet', 'desktop', 'web')),
+    CHECK (
+      (scope = 'account' AND profile_id IS NULL AND client_family IS NULL AND device_id IS NULL AND library_id IS NULL AND series_id IS NULL) OR
+      (scope = 'profile' AND profile_id IS NOT NULL AND client_family IS NULL AND device_id IS NULL AND library_id IS NULL AND series_id IS NULL) OR
+      (scope = 'profile_client' AND profile_id IS NOT NULL AND client_family IS NOT NULL AND device_id IS NULL AND library_id IS NULL AND series_id IS NULL) OR
+      (scope = 'profile_device' AND profile_id IS NOT NULL AND client_family IS NULL AND device_id IS NOT NULL AND library_id IS NULL AND series_id IS NULL) OR
+      (scope = 'profile_library' AND profile_id IS NOT NULL AND client_family IS NULL AND device_id IS NULL AND library_id IS NOT NULL AND series_id IS NULL) OR
+      (scope = 'profile_series' AND profile_id IS NOT NULL AND client_family IS NULL AND device_id IS NULL AND library_id IS NULL AND series_id IS NOT NULL)
+    )
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS user_setting_values_account_uq
+    ON user_setting_values (key) WHERE scope = 'account';
+CREATE UNIQUE INDEX IF NOT EXISTS user_setting_values_profile_uq
+    ON user_setting_values (profile_id, key) WHERE scope = 'profile';
+CREATE UNIQUE INDEX IF NOT EXISTS user_setting_values_profile_device_uq
+    ON user_setting_values (profile_id, device_id, key) WHERE scope = 'profile_device';
+CREATE UNIQUE INDEX IF NOT EXISTS user_setting_values_profile_library_uq
+    ON user_setting_values (profile_id, library_id, key) WHERE scope = 'profile_library';
+CREATE UNIQUE INDEX IF NOT EXISTS user_setting_values_profile_series_uq
+    ON user_setting_values (profile_id, series_id, key) WHERE scope = 'profile_series';
+
+CREATE INDEX IF NOT EXISTS user_setting_values_resolution_idx
+    ON user_setting_values (profile_id, key, scope);
+CREATE INDEX IF NOT EXISTS user_setting_values_series_idx
+    ON user_setting_values (profile_id, series_id);
+CREATE INDEX IF NOT EXISTS user_setting_values_library_idx
+    ON user_setting_values (profile_id, library_id);
+
+CREATE TABLE IF NOT EXISTS user_setting_mutations (
+    mutation_id  TEXT PRIMARY KEY,
+    request_hash TEXT NOT NULL,
+    result       TEXT NOT NULL CHECK (json_valid(result)),
+    created_at   TEXT NOT NULL,
+    expires_at   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS user_setting_mutations_expiry_idx
+    ON user_setting_mutations (expires_at);
+
+CREATE TABLE IF NOT EXISTS user_setting_migration_rejects (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_table TEXT NOT NULL,
+    source_key   TEXT NOT NULL,
+    identity     TEXT NOT NULL CHECK (json_valid(identity)),
+    value        TEXT,
+    reason       TEXT NOT NULL,
+    recorded_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS user_setting_migration_rejects_source_idx
+    ON user_setting_migration_rejects (source_table);
+`
+
+// InitSchema creates all tables in the given SQLite database.
+func InitSchema(db *sql.DB) error {
+	_, err := db.Exec(Schema)
+	if err != nil {
+		return err
+	}
+	if err := ensureSettingValuesClientFamily(db); err != nil {
+		return err
+	}
+	if err := ensureProfileSectionOverridesRemovedColumn(db); err != nil {
+		return err
+	}
+	if err := ensureProfileSectionOverridesUserAddedColumns(db); err != nil {
+		return err
+	}
+	if err := ensureWatchHistorySourceColumn(db); err != nil {
+		return err
+	}
+	if err := ensureShowForcedSubtitleColumns(db); err != nil {
+		return err
+	}
+	if err := ensureProfileIsPrimaryColumn(db); err != nil {
+		return err
+	}
+	if err := ensureDeviceSettingsProfileColumn(db); err != nil {
+		return err
+	}
+	if err := ensureAutoSkipRecapPreviewColumns(db); err != nil {
+		return err
+	}
+	if err := ensureWatchHistoryIdentityColumn(db); err != nil {
+		return err
+	}
+	if err := ensureWatchProgressSyncColumns(db); err != nil {
+		return err
+	}
+	if err := migratePlaybackSettingsToDeviceScope(db); err != nil {
+		return err
+	}
+	return backfillUserDevices(db)
+}
+
+// ensureSettingValuesClientFamily upgrades the canonical settings table before
+// runMigrations reads it. InitSchema runs first on every open, and SQLite
+// cannot widen a table CHECK constraint with ALTER TABLE, so an existing table
+// must be rebuilt here rather than merely gaining a nullable column. The
+// rebuild is transactional and preserves ids, revisions, values, and
+// timestamps verbatim.
+func ensureSettingValuesClientFamily(db *sql.DB) error {
+	var count int
+	if err := db.QueryRow(
+		"SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?",
+		"user_setting_values", "client_family",
+	).Scan(&count); err != nil {
+		return fmt.Errorf("checking user_setting_values.client_family column: %w", err)
+	}
+	if count > 0 {
+		_, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS user_setting_values_profile_client_uq
+			ON user_setting_values (profile_id, client_family, key) WHERE scope = 'profile_client'`)
+		if err != nil {
+			return fmt.Errorf("creating profile_client setting index: %w", err)
+		}
+		return nil
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("beginning profile_client settings migration: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	if _, err := tx.Exec(`
+CREATE TABLE user_setting_values_profile_client_new (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    key           TEXT NOT NULL,
+    scope         TEXT NOT NULL,
+    profile_id    TEXT,
+    client_family TEXT,
+    device_id     TEXT,
+    library_id    INTEGER,
+    series_id     TEXT,
+    value         TEXT NOT NULL CHECK (json_valid(value)),
+    revision      INTEGER NOT NULL DEFAULT 1,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    CHECK (scope IN ('account', 'profile', 'profile_client', 'profile_device', 'profile_library', 'profile_series')),
+    CHECK (client_family IS NULL OR client_family IN ('tv', 'mobile', 'tablet', 'desktop', 'web')),
+    CHECK (
+      (scope = 'account' AND profile_id IS NULL AND client_family IS NULL AND device_id IS NULL AND library_id IS NULL AND series_id IS NULL) OR
+      (scope = 'profile' AND profile_id IS NOT NULL AND client_family IS NULL AND device_id IS NULL AND library_id IS NULL AND series_id IS NULL) OR
+      (scope = 'profile_client' AND profile_id IS NOT NULL AND client_family IS NOT NULL AND device_id IS NULL AND library_id IS NULL AND series_id IS NULL) OR
+      (scope = 'profile_device' AND profile_id IS NOT NULL AND client_family IS NULL AND device_id IS NOT NULL AND library_id IS NULL AND series_id IS NULL) OR
+      (scope = 'profile_library' AND profile_id IS NOT NULL AND client_family IS NULL AND device_id IS NULL AND library_id IS NOT NULL AND series_id IS NULL) OR
+      (scope = 'profile_series' AND profile_id IS NOT NULL AND client_family IS NULL AND device_id IS NULL AND library_id IS NULL AND series_id IS NOT NULL)
+    )
+);
+INSERT INTO user_setting_values_profile_client_new
+    (id, key, scope, profile_id, client_family, device_id, library_id, series_id,
+     value, revision, created_at, updated_at)
+SELECT id, key, scope, profile_id, NULL, device_id, library_id, series_id,
+       value, revision, created_at, updated_at
+  FROM user_setting_values;
+DROP TABLE user_setting_values;
+ALTER TABLE user_setting_values_profile_client_new RENAME TO user_setting_values;
+CREATE UNIQUE INDEX user_setting_values_account_uq
+    ON user_setting_values (key) WHERE scope = 'account';
+CREATE UNIQUE INDEX user_setting_values_profile_uq
+    ON user_setting_values (profile_id, key) WHERE scope = 'profile';
+CREATE UNIQUE INDEX user_setting_values_profile_client_uq
+    ON user_setting_values (profile_id, client_family, key) WHERE scope = 'profile_client';
+CREATE UNIQUE INDEX user_setting_values_profile_device_uq
+    ON user_setting_values (profile_id, device_id, key) WHERE scope = 'profile_device';
+CREATE UNIQUE INDEX user_setting_values_profile_library_uq
+    ON user_setting_values (profile_id, library_id, key) WHERE scope = 'profile_library';
+CREATE UNIQUE INDEX user_setting_values_profile_series_uq
+    ON user_setting_values (profile_id, series_id, key) WHERE scope = 'profile_series';
+CREATE INDEX user_setting_values_resolution_idx
+    ON user_setting_values (profile_id, key, scope);
+CREATE INDEX user_setting_values_series_idx
+    ON user_setting_values (profile_id, series_id);
+CREATE INDEX user_setting_values_library_idx
+    ON user_setting_values (profile_id, library_id);
+`); err != nil {
+		return fmt.Errorf("rebuilding user_setting_values for profile_client: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing profile_client settings migration: %w", err)
+	}
+	return nil
+}
+
+// watchProgressSyncTriggers stamps the server-owned cursor (synced_seq) on every
+// watch_progress write and owns the LWW key: event_at defaults to the write
+// time, and an UPDATE that changed updated_at without explicitly changing
+// event_at advances it too (else a queued offline event older than that write
+// would win SetProgressIfNewer's comparison and resurrect stale progress).
+// Writes that DO set event_at — offline sync's clamped client event time —
+// keep their value. With recursive_triggers OFF (the userdb default) the
+// trigger's own UPDATE does not re-fire it. See the offline-sync design
+// (invariant 1). CREATE TRIGGER IF NOT EXISTS never replaces an existing
+// trigger, so changing a body requires a migrate.go step dropping the old one
+// (see migrateToV13).
+const watchProgressSyncTriggers = `
+CREATE TRIGGER IF NOT EXISTS watch_progress_stamp_ins AFTER INSERT ON watch_progress
+BEGIN
+    UPDATE watch_progress
+    SET synced_seq = (SELECT COALESCE(MAX(synced_seq), 0) + 1 FROM watch_progress),
+        event_at = COALESCE(event_at, updated_at)
+    WHERE rowid = NEW.rowid;
+END;
+CREATE TRIGGER IF NOT EXISTS watch_progress_stamp_upd AFTER UPDATE ON watch_progress
+BEGIN
+    UPDATE watch_progress
+    SET synced_seq = (SELECT COALESCE(MAX(synced_seq), 0) + 1 FROM watch_progress),
+        event_at = CASE
+            WHEN NEW.event_at IS NULL THEN NEW.updated_at
+            WHEN NEW.event_at IS OLD.event_at AND NEW.updated_at IS NOT OLD.updated_at THEN NEW.updated_at
+            ELSE NEW.event_at
+        END
+    WHERE rowid = NEW.rowid;
+END;
+CREATE INDEX IF NOT EXISTS watch_progress_synced_idx ON watch_progress (profile_id, synced_seq);
+`
+
+// ensureWatchProgressSyncColumns adds the event_at (LWW key) and synced_seq
+// (server cursor) columns, backfills them, and installs the stamping triggers.
+// Idempotent: safe to run on every open for both fresh and existing databases.
+func ensureWatchProgressSyncColumns(db *sql.DB) error {
+	columns := []struct{ name, definition string }{
+		{name: "event_at", definition: "TEXT"},
+		{name: "synced_seq", definition: "INTEGER"},
+	}
+	for _, column := range columns {
+		var count int
+		if err := db.QueryRow(
+			"SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?",
+			"watch_progress", column.name,
+		).Scan(&count); err != nil {
+			return fmt.Errorf("checking watch_progress.%s column: %w", column.name, err)
+		}
+		if count > 0 {
+			continue
+		}
+		if _, err := db.Exec(
+			fmt.Sprintf("ALTER TABLE watch_progress ADD COLUMN %s %s", column.name, column.definition),
+		); err != nil {
+			return fmt.Errorf("adding watch_progress.%s column: %w", column.name, err)
+		}
+	}
+
+	// Backfill before the triggers exist so these one-off writes don't trip them.
+	if _, err := db.Exec(`UPDATE watch_progress SET event_at = updated_at WHERE event_at IS NULL`); err != nil {
+		return fmt.Errorf("backfilling watch_progress.event_at: %w", err)
+	}
+	if _, err := db.Exec(`
+		UPDATE watch_progress SET synced_seq = (
+			SELECT COUNT(*) FROM watch_progress w2
+			WHERE w2.updated_at < watch_progress.updated_at
+			   OR (w2.updated_at = watch_progress.updated_at AND w2.rowid <= watch_progress.rowid)
+		) WHERE synced_seq IS NULL`); err != nil {
+		return fmt.Errorf("backfilling watch_progress.synced_seq: %w", err)
+	}
+
+	if _, err := db.Exec(watchProgressSyncTriggers); err != nil {
+		return fmt.Errorf("installing watch_progress sync triggers: %w", err)
+	}
+	return nil
+}
+
+func ensureAutoSkipRecapPreviewColumns(db *sql.DB) error {
+	columns := []struct {
+		name       string
+		definition string
+	}{
+		{name: "auto_skip_recap", definition: "BOOLEAN DEFAULT false"},
+		{name: "auto_play_next_preview", definition: "BOOLEAN DEFAULT false"},
+	}
+
+	for _, column := range columns {
+		var count int
+		if err := db.QueryRow(
+			"SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?",
+			"profiles",
+			column.name,
+		).Scan(&count); err != nil {
+			return fmt.Errorf("checking profiles.%s column: %w", column.name, err)
+		}
+		if count > 0 {
+			continue
+		}
+		if _, err := db.Exec(
+			fmt.Sprintf("ALTER TABLE profiles ADD COLUMN %s %s", column.name, column.definition),
+		); err != nil {
+			return fmt.Errorf("adding profiles.%s column: %w", column.name, err)
+		}
+	}
+	return nil
+}
+
+func ensureWatchHistoryIdentityColumn(db *sql.DB) error {
+	var count int
+	if err := db.QueryRow(
+		"SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?",
+		"watch_history",
+		"watch_identity",
+	).Scan(&count); err != nil {
+		return fmt.Errorf("checking watch_history.watch_identity column: %w", err)
+	}
+	if count > 0 {
+		return nil
+	}
+	if _, err := db.Exec("ALTER TABLE watch_history ADD COLUMN watch_identity TEXT NOT NULL DEFAULT '{}'"); err != nil {
+		return fmt.Errorf("adding watch_history.watch_identity: %w", err)
+	}
+	return nil
+}
+
+func ensureProfileIsPrimaryColumn(db *sql.DB) error {
+	var count int
+	if err := db.QueryRow(
+		"SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?",
+		"profiles",
+		"is_primary",
+	).Scan(&count); err != nil {
+		return fmt.Errorf("checking profiles.is_primary column: %w", err)
+	}
+	if count == 0 {
+		if _, err := db.Exec(
+			"ALTER TABLE profiles ADD COLUMN is_primary BOOLEAN NOT NULL DEFAULT false",
+		); err != nil {
+			return fmt.Errorf("adding profiles.is_primary column: %w", err)
+		}
+	}
+	// Backfill: the oldest existing profile (per-user sqlite file, so just the
+	// oldest row overall) is the primary. No-op if a primary already exists.
+	if _, err := db.Exec(`
+		UPDATE profiles
+		SET is_primary = 1
+		WHERE id = (
+			SELECT id FROM profiles
+			WHERE NOT EXISTS (SELECT 1 FROM profiles WHERE is_primary)
+			ORDER BY created_at ASC, id ASC
+			LIMIT 1
+		)
+	`); err != nil {
+		return fmt.Errorf("backfilling profiles.is_primary: %w", err)
+	}
+	return nil
+}
+
+func ensureDeviceSettingsProfileColumn(db *sql.DB) error {
+	var count int
+	if err := db.QueryRow(
+		"SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?",
+		"user_device_settings",
+		"profile_id",
+	).Scan(&count); err != nil {
+		return fmt.Errorf("checking user_device_settings.profile_id column: %w", err)
+	}
+	if count > 0 {
+		return nil
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("beginning user_device_settings profile migration: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	if _, err := tx.Exec(`
+		CREATE TABLE user_device_settings_new (
+			profile_id TEXT NOT NULL,
+			device_id TEXT NOT NULL,
+			key TEXT NOT NULL,
+			value TEXT NOT NULL,
+			device_name TEXT NOT NULL DEFAULT '',
+			device_platform TEXT NOT NULL DEFAULT '',
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY (profile_id, device_id, key)
+		)
+	`); err != nil {
+		return fmt.Errorf("creating user_device_settings_new: %w", err)
+	}
+
+	if _, err := tx.Exec(`
+			INSERT INTO profiles (id, name, is_primary, created_at, updated_at)
+			SELECT 'default', 'Default', 1, datetime('now'), datetime('now')
+			WHERE NOT EXISTS (SELECT 1 FROM profiles)
+		`); err != nil {
+		return fmt.Errorf("ensuring default profile for user_device_settings migration: %w", err)
+	}
+
+	if _, err := tx.Exec(`
+			INSERT INTO user_device_settings_new (
+				profile_id, device_id, key, value, device_name, device_platform, updated_at
+			)
+			SELECT p.id, uds.device_id, uds.key, uds.value, uds.device_name, uds.device_platform, uds.updated_at
+			FROM user_device_settings uds
+			JOIN (
+				SELECT id
+				FROM profiles
+				ORDER BY is_primary DESC, created_at ASC, id ASC
+				LIMIT 1
+			) p ON 1 = 1
+		`); err != nil {
+		return fmt.Errorf("backfilling profile-aware user_device_settings: %w", err)
+	}
+
+	if _, err := tx.Exec(`DROP TABLE user_device_settings`); err != nil {
+		return fmt.Errorf("dropping legacy user_device_settings: %w", err)
+	}
+	if _, err := tx.Exec(`ALTER TABLE user_device_settings_new RENAME TO user_device_settings`); err != nil {
+		return fmt.Errorf("renaming profile-aware user_device_settings: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+func backfillUserDevices(db *sql.DB) error {
+	_, err := db.Exec(`
+		INSERT INTO user_devices (
+			profile_id, device_id, device_name, device_platform, last_seen_at
+		)
+		SELECT
+			profile_id,
+			device_id,
+			COALESCE(MAX(device_name), ''),
+			COALESCE(MAX(device_platform), ''),
+			MAX(updated_at)
+		FROM user_device_settings
+		WHERE TRIM(device_id) <> ''
+		GROUP BY profile_id, device_id
+		ON CONFLICT(profile_id, device_id) DO UPDATE SET
+			device_name = CASE
+				WHEN excluded.device_name <> '' THEN excluded.device_name
+				ELSE user_devices.device_name
+			END,
+			device_platform = CASE
+				WHEN excluded.device_platform <> '' THEN excluded.device_platform
+				ELSE user_devices.device_platform
+			END,
+			last_seen_at = CASE
+				WHEN excluded.last_seen_at > user_devices.last_seen_at THEN excluded.last_seen_at
+				ELSE user_devices.last_seen_at
+			END
+	`)
+	if err != nil {
+		return fmt.Errorf("backfilling user_devices: %w", err)
+	}
+	return nil
+}
+
+func ensureProfileSectionOverridesRemovedColumn(db *sql.DB) error {
+	var count int
+	if err := db.QueryRow(
+		"SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?",
+		"profile_section_overrides",
+		"removed",
+	).Scan(&count); err != nil {
+		return fmt.Errorf("checking profile_section_overrides.removed column: %w", err)
+	}
+	if count > 0 {
+		return nil
+	}
+	if _, err := db.Exec("ALTER TABLE profile_section_overrides ADD COLUMN removed INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("adding profile_section_overrides.removed: %w", err)
+	}
+	return nil
+}
+
+// ensureProfileSectionOverridesUserAddedColumns adds the four columns that back
+// user-added (profile-built) sections so SaveSectionOverrides can round-trip
+// IsUserAdded / UserSectionType / UserConfig / UserTitle. Without these columns
+// those fields are silently dropped on save and lost on subsequent reads.
+func ensureProfileSectionOverridesUserAddedColumns(db *sql.DB) error {
+	columns := []struct {
+		name       string
+		definition string
+	}{
+		{name: "is_user_added", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "user_section_type", definition: "TEXT"},
+		{name: "user_config", definition: "TEXT"},
+		{name: "user_title", definition: "TEXT"},
+	}
+	for _, c := range columns {
+		var count int
+		if err := db.QueryRow(
+			"SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?",
+			"profile_section_overrides",
+			c.name,
+		).Scan(&count); err != nil {
+			return fmt.Errorf("checking profile_section_overrides.%s column: %w", c.name, err)
+		}
+		if count > 0 {
+			continue
+		}
+		if _, err := db.Exec(fmt.Sprintf(
+			"ALTER TABLE profile_section_overrides ADD COLUMN %s %s", c.name, c.definition,
+		)); err != nil {
+			return fmt.Errorf("adding profile_section_overrides.%s: %w", c.name, err)
+		}
+	}
+	return nil
+}
+
+func ensureWatchHistorySourceColumn(db *sql.DB) error {
+	var count int
+	if err := db.QueryRow(
+		"SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?",
+		"watch_history",
+		"source",
+	).Scan(&count); err != nil {
+		return fmt.Errorf("checking watch_history.source column: %w", err)
+	}
+	if count > 0 {
+		return nil
+	}
+	if _, err := db.Exec("ALTER TABLE watch_history ADD COLUMN source TEXT NOT NULL DEFAULT 'legacy'"); err != nil {
+		return fmt.Errorf("adding watch_history.source: %w", err)
+	}
+	return nil
+}
+
+func ensureShowForcedSubtitleColumns(db *sql.DB) error {
+	columns := []struct {
+		table      string
+		column     string
+		definition string
+	}{
+		{table: "profiles", column: "show_forced_subtitles", definition: "BOOLEAN NOT NULL DEFAULT true"},
+		{table: "library_playback_preferences", column: "show_forced_subtitles", definition: "BOOLEAN"},
+		{table: "subtitle_preferences", column: "show_forced_subtitles", definition: "BOOLEAN"},
+	}
+
+	for _, column := range columns {
+		var count int
+		if err := db.QueryRow(
+			"SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?",
+			column.table,
+			column.column,
+		).Scan(&count); err != nil {
+			return fmt.Errorf("checking %s.%s column: %w", column.table, column.column, err)
+		}
+		if count > 0 {
+			continue
+		}
+		if _, err := db.Exec(
+			fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", column.table, column.column, column.definition),
+		); err != nil {
+			return fmt.Errorf("adding %s.%s column: %w", column.table, column.column, err)
+		}
+	}
+
+	return nil
+}
+
+func migratePlaybackSettingsToDeviceScope(db *sql.DB) error {
+	version, err := userVersion(db)
+	if err != nil {
+		return err
+	}
+	if version == 0 || version >= 9 {
+		return nil
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("beginning playback settings device-scope migration: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	if _, err := tx.Exec(`
+		INSERT OR IGNORE INTO user_device_settings (
+			profile_id, device_id, key, value, device_name, device_platform, updated_at
+		)
+		SELECT
+			devices.profile_id,
+			devices.device_id,
+			settings.key,
+			settings.value,
+			devices.device_name,
+			devices.device_platform,
+			devices.updated_at
+			FROM user_settings AS settings
+			JOIN (
+				SELECT DISTINCT profile_id, device_id, device_name, device_platform, updated_at
+				FROM user_device_settings
+			) AS devices ON 1 = 1
+			WHERE settings.key IN (
+				'playback.preferred_quality',
+				'playback.audio_language',
+				'playback.auto_skip_intro',
+				'playback.auto_skip_credits',
+				'playback.auto_play_next'
+			)
+			AND NOT EXISTS (
+				SELECT 1
+				FROM user_device_settings AS existing
+				WHERE existing.profile_id = devices.profile_id
+				  AND existing.device_id = devices.device_id
+				  AND existing.key = settings.key
+			)
+			`); err != nil {
+		return fmt.Errorf("backfilling playback settings into user_device_settings: %w", err)
+	}
+
+	return tx.Commit()
+}

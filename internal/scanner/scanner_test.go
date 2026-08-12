@@ -1,0 +1,345 @@
+package scanner
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/Vondel-Media/vondel-server/internal/models"
+)
+
+type recordingQueueSyncer struct {
+	folderID int
+	scope    string
+}
+
+func (s *recordingQueueSyncer) SyncForFolder(context.Context, int) error {
+	return nil
+}
+
+func (s *recordingQueueSyncer) SyncInScope(_ context.Context, folderID int, scopePath string) error {
+	s.folderID = folderID
+	s.scope = scopePath
+	return nil
+}
+
+func TestCollectLogicalFilePaths_PreservesLogicalSymlinkRootPaths(t *testing.T) {
+	t.Parallel()
+
+	base := t.TempDir()
+	physicalRoot := filepath.Join(base, "real")
+	logicalRoot := filepath.Join(base, "library")
+	seasonDir := filepath.Join(physicalRoot, "Season 1")
+
+	if err := os.MkdirAll(seasonDir, 0o755); err != nil {
+		t.Fatalf("mkdir season dir: %v", err)
+	}
+	filePath := filepath.Join(seasonDir, "Episode 01.mkv")
+	if err := os.WriteFile(filePath, []byte("test"), 0o644); err != nil {
+		t.Fatalf("write media file: %v", err)
+	}
+	if err := os.Symlink(physicalRoot, logicalRoot); err != nil {
+		t.Skipf("symlinks not supported on this platform: %v", err)
+	}
+
+	files, walkFailures, err := collectLogicalFilePaths(context.Background(), []string{logicalRoot}, "series")
+	if err != nil {
+		t.Fatalf("collect logical paths: %v", err)
+	}
+	if len(walkFailures) != 0 {
+		t.Fatalf("walkFailures = %v, want none for a fully readable tree", walkFailures)
+	}
+
+	want := filepath.Join(logicalRoot, "Season 1", "Episode 01.mkv")
+	if len(files) != 1 {
+		t.Fatalf("files len = %d, want 1 (%v)", len(files), files)
+	}
+	if files[0] != want {
+		t.Fatalf("files[0] = %q, want %q", files[0], want)
+	}
+}
+
+func TestCollectLogicalFilePaths_DedupesSharedPhysicalDirsAndCycles(t *testing.T) {
+	t.Parallel()
+
+	base := t.TempDir()
+	physicalRoot := filepath.Join(base, "real")
+	aliasRoot := filepath.Join(base, "alias")
+	loopPath := filepath.Join(physicalRoot, "loop")
+
+	if err := os.MkdirAll(physicalRoot, 0o755); err != nil {
+		t.Fatalf("mkdir root: %v", err)
+	}
+	filePath := filepath.Join(physicalRoot, "Movie.mkv")
+	if err := os.WriteFile(filePath, []byte("test"), 0o644); err != nil {
+		t.Fatalf("write media file: %v", err)
+	}
+	if err := os.Symlink(physicalRoot, aliasRoot); err != nil {
+		t.Skipf("symlinks not supported on this platform: %v", err)
+	}
+	if err := os.Symlink(physicalRoot, loopPath); err != nil {
+		t.Skipf("symlinks not supported on this platform: %v", err)
+	}
+
+	files, walkFailures, err := collectLogicalFilePaths(context.Background(), []string{physicalRoot, aliasRoot}, "movie")
+	if err != nil {
+		t.Fatalf("collect logical paths: %v", err)
+	}
+	if len(walkFailures) != 0 {
+		t.Fatalf("walkFailures = %v, want none for a fully readable tree", walkFailures)
+	}
+
+	sort.Strings(files)
+	want := []string{filepath.Join(physicalRoot, "Movie.mkv")}
+	if len(files) != len(want) {
+		t.Fatalf("files len = %d, want %d (%v)", len(files), len(want), files)
+	}
+	for i := range want {
+		if files[i] != want[i] {
+			t.Fatalf("files[%d] = %q, want %q", i, files[i], want[i])
+		}
+	}
+}
+
+func TestShouldSkipStableConfirmedFile_DoesNotSkipAssignmentChanges(t *testing.T) {
+	t.Parallel()
+
+	modifiedAt := time.Now().UTC().Truncate(time.Microsecond)
+	existing := &models.MediaFile{
+		ContentID:      "matched-content",
+		FileSize:       1_000,
+		FileModifiedAt: &modifiedAt,
+	}
+
+	if shouldSkipStableConfirmedFile(existing, "matched", 1_000, modifiedAt, []string{"root_assignment_changed"}, false) {
+		t.Fatal("expected assignment changes to bypass stable-file skip")
+	}
+	if !shouldSkipStableConfirmedFile(existing, "matched", 1_000, modifiedAt, nil, false) {
+		t.Fatal("expected unchanged matched file to use stable-file skip")
+	}
+}
+
+func TestScanStateUpdateReasons_DetectsMissingExternalSubtitle(t *testing.T) {
+	t.Parallel()
+
+	modifiedAt := time.Now().UTC().Truncate(time.Microsecond)
+	existing := &scanStateFile{
+		ContentID:             "matched-content",
+		FileSize:              1_000,
+		FileModifiedAt:        &modifiedAt,
+		ExternalSubtitlePaths: []string{filepath.Join(t.TempDir(), "Movie.en.srt")},
+	}
+
+	reasons := scanStateUpdateReasons(existing, 1_000, modifiedAt, nil, false, fileRootAssignment{}, fileGroupAssignment{}, "movies", false)
+	if !testStringSliceContains(reasons, "external_subtitle_missing") {
+		t.Fatalf("expected external_subtitle_missing reason, got %#v", reasons)
+	}
+	if shouldSkipStableConfirmedScanState(existing, "matched", 1_000, modifiedAt, reasons, false) {
+		t.Fatal("expected missing external subtitle to bypass stable scan-state skip")
+	}
+}
+
+func TestScanStateUpdateReasons_DetectsExternalSubtitleInventoryChange(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	modifiedAt := time.Now().UTC().Truncate(time.Microsecond)
+	existing := &scanStateFile{
+		ContentID:             "matched-content",
+		FileSize:              1_000,
+		FileModifiedAt:        &modifiedAt,
+		ExternalSubtitlePaths: []string{filepath.Join(dir, "Movie.en.srt")},
+	}
+
+	reasons := scanStateUpdateReasons(
+		existing,
+		1_000,
+		modifiedAt,
+		[]string{filepath.Join(dir, "Movie.en.srt"), filepath.Join(dir, "Movie.fr.srt")},
+		true,
+		fileRootAssignment{},
+		fileGroupAssignment{},
+		"movies",
+		false,
+	)
+	if !testStringSliceContains(reasons, "external_subtitle_changed") {
+		t.Fatalf("expected external_subtitle_changed reason, got %#v", reasons)
+	}
+	if shouldSkipStableConfirmedScanState(existing, "matched", 1_000, modifiedAt, reasons, false) {
+		t.Fatal("expected external subtitle change to bypass stable scan-state skip")
+	}
+}
+
+func TestIdentityOnlyUpdateReasons(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		reasons []string
+		want    bool
+	}{
+		{"empty", nil, false},
+		{"group only", []string{"group_assignment_changed"}, true},
+		{"root only", []string{"root_assignment_changed"}, true},
+		{"group and root", []string{"group_assignment_changed", "root_assignment_changed"}, true},
+		{"group plus mtime needs reprobe", []string{"group_assignment_changed", "mtime_changed"}, false},
+		{"probe repair needs reprobe", []string{"probe_repair"}, false},
+		{"size change needs reprobe", []string{"size_changed"}, false},
+		{"was missing needs reprobe", []string{"was_missing"}, false},
+		{"subtitle change is not identity-only", []string{"external_subtitle_changed"}, false},
+		{"group plus subtitle needs full path", []string{"group_assignment_changed", "external_subtitle_changed"}, false},
+	}
+	for _, tc := range cases {
+		if got := identityOnlyUpdateReasons(tc.reasons); got != tc.want {
+			t.Errorf("identityOnlyUpdateReasons(%#v) = %v, want %v", tc.reasons, got, tc.want)
+		}
+	}
+}
+
+func TestIdentityOnlyFastPathEligible(t *testing.T) {
+	t.Parallel()
+
+	identityReasons := []string{"group_assignment_changed"}
+	cases := []struct {
+		name     string
+		existing scanStateFile
+		reasons  []string
+		want     bool
+	}{
+		{"probed primary row", scanStateFile{FileHash: "abc"}, identityReasons, true},
+		{"non-identity reasons need full path", scanStateFile{FileHash: "abc"}, []string{"size_changed"}, false},
+		// A row still linked as an extra is being reclassified as primary;
+		// only the full upsert clears extra_id so matching can pick it up.
+		{"former extra needs full path", scanStateFile{ExtraID: "extra-1", FileHash: "abc"}, identityReasons, false},
+		// A hash-less row needs the full path once to backfill OSHash and the
+		// hash-keyed S3 markers.
+		{"missing hash needs full path", scanStateFile{}, identityReasons, false},
+	}
+	for _, tc := range cases {
+		if got := identityOnlyFastPathEligible(&tc.existing, tc.reasons); got != tc.want {
+			t.Errorf("%s: identityOnlyFastPathEligible = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func testStringSliceContains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func TestWalkModeForEbookLibraryTypes(t *testing.T) {
+	for _, libraryType := range []string{"ebook", "ebooks", " EBOOKS "} {
+		if got := walkModeFor(libraryType); got != walkModeEbook {
+			t.Fatalf("walkModeFor(%q) = %v, want %v", libraryType, got, walkModeEbook)
+		}
+	}
+}
+
+func TestWalkModeEbookAcceptsEbookExtensionsOnly(t *testing.T) {
+	for _, ext := range []string{".epub", ".pdf", ".mobi", ".azw", ".azw3", ".fb2", ".fbz", ".cbz", ".cbr"} {
+		if !walkModeEbook.acceptsExt(ext) {
+			t.Fatalf("walkModeEbook should accept %s", ext)
+		}
+	}
+	for _, ext := range []string{".txt", ".md", ".mp4", ".mp3", ".mkv"} {
+		if walkModeEbook.acceptsExt(ext) {
+			t.Fatalf("walkModeEbook should reject %s", ext)
+		}
+	}
+	if !walkModeEbook.acceptsPath("Book.fb2.zip") {
+		t.Fatal("walkModeEbook should accept .fb2.zip compound extension")
+	}
+}
+
+func TestScanFolderEbookLibraryRoutesToEbookScanner(t *testing.T) {
+	scanner := &Scanner{}
+	result, err := scanner.ScanFolder(context.Background(), &models.MediaFolder{
+		ID:    0,
+		Type:  " ebooks ",
+		Paths: []string{t.TempDir()},
+	})
+	if err != nil {
+		t.Fatalf("ScanFolder ebook error = %v, want nil", err)
+	}
+	if result == nil {
+		t.Fatal("ScanFolder ebook result = nil, want empty result")
+	}
+}
+
+func TestScanSubtreeEbookLibraryRoutesToEbookScanner(t *testing.T) {
+	subtree := t.TempDir()
+
+	scanner := &Scanner{}
+	result, err := scanner.ScanSubtree(context.Background(), &models.MediaFolder{
+		ID:    0,
+		Type:  "ebook",
+		Paths: []string{subtree},
+	}, subtree)
+	if err != nil {
+		t.Fatalf("ScanSubtree ebook error = %v, want nil", err)
+	}
+	if result == nil {
+		t.Fatal("ScanSubtree ebook result = nil, want empty result")
+	}
+}
+
+func TestScanFileEbookLibraryUsesEbookPipeline(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "book.epub")
+	if err := os.WriteFile(filePath, []byte("not a real epub"), 0o644); err != nil {
+		t.Fatalf("write fake ebook: %v", err)
+	}
+
+	err := (&Scanner{}).ScanFile(context.Background(), filePath, &models.MediaFolder{ID: 44, Type: "ebooks"})
+	if err == nil {
+		t.Fatal("ScanFile returned nil, want ebook parse failure")
+	}
+	if strings.Contains(err.Error(), "unrecognized video extension") {
+		t.Fatalf("ScanFile used video extension gate: %v", err)
+	}
+	if !strings.Contains(err.Error(), "folder_id=44") {
+		t.Fatalf("error = %q, want ebook scanner aggregate failure", err)
+	}
+}
+
+func TestScanFileMangaLibraryUsesMangaPipeline(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "chapter.cbz")
+	if err := os.WriteFile(filePath, []byte("not a real cbz"), 0o644); err != nil {
+		t.Fatalf("write fake manga: %v", err)
+	}
+
+	err := (&Scanner{}).ScanFile(context.Background(), filePath, &models.MediaFolder{ID: 45, Type: "manga"})
+	if err == nil {
+		t.Fatal("ScanFile returned nil, want manga parse failure")
+	}
+	if strings.Contains(err.Error(), "unrecognized video extension") {
+		t.Fatalf("ScanFile used video extension gate: %v", err)
+	}
+	if !strings.Contains(err.Error(), "folder_id=45") {
+		t.Fatalf("error = %q, want manga scanner aggregate failure", err)
+	}
+}
+
+func TestSyncVanishedVideoQueuesUsesParentAndExactFileScopes(t *testing.T) {
+	series := &recordingQueueSyncer{}
+	movie := &recordingQueueSyncer{}
+	filePath := filepath.Join("/media", "Movie", "Movie.mkv")
+	scanner := &Scanner{seriesQueueSyncer: series, movieQueueSyncer: movie}
+
+	if err := scanner.syncVanishedVideoQueues(context.Background(), 17, filePath); err != nil {
+		t.Fatalf("syncVanishedVideoQueues: %v", err)
+	}
+	if series.folderID != 17 || series.scope != filepath.Dir(filePath) {
+		t.Fatalf("series sync = folder %d scope %q", series.folderID, series.scope)
+	}
+	if movie.folderID != 17 || movie.scope != filepath.Clean(filePath) {
+		t.Fatalf("movie sync = folder %d scope %q", movie.folderID, movie.scope)
+	}
+}

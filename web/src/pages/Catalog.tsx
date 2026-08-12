@@ -1,0 +1,385 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useSearchParams } from "react-router";
+import { CheckSquare, Search, Trash2, X } from "lucide-react";
+
+import type { BrowseItem } from "@/api/types";
+import ItemGrid from "@/components/ItemGrid";
+import { RequestToAddSection } from "@/components/RequestToAddSection";
+import { Button } from "@/components/ui/button";
+import CatalogFiltersPanel from "@/components/catalog/CatalogFiltersPanel";
+import SearchScopeChips from "@/components/catalog/SearchScopeChips";
+import { useCatalogWindow } from "@/hooks/queries/catalog";
+import { useSearchMediaScope, type SearchMediaScope } from "@/hooks/useSearchMediaScope";
+import { useRemoveHistory } from "@/hooks/queries/history";
+import { useRequestSearch } from "@/hooks/queries/useRequests";
+import { useCanRequest } from "@/hooks/useCanRequest";
+import { useDebounce } from "@/hooks/useDebounce";
+import { useDocumentTitle } from "@/hooks/useDocumentTitle";
+import SearchBar from "@/components/SearchBar";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
+import {
+  buildHistoryRemovalTarget,
+  historyRemovalDialogDescription,
+  historyRemovalDialogTitle,
+} from "@/lib/historyRemoval";
+
+import {
+  buildCatalogFilterSearchParams,
+  buildCatalogQueryUpdateHref,
+  catalogSourceAllowsOverlay,
+  parseCatalogSearchParams,
+} from "./catalogSearchParams";
+
+const REQUEST_SEARCH_DEBOUNCE_MS = 100;
+
+function defaultCatalogTitle(source: string, searchQuery?: string) {
+  if (source === "favorites") return "Favorites";
+  if (source === "watchlist") return "Watchlist";
+  if (source === "history") return "History";
+  if (searchQuery) return `Results for "${searchQuery}"`;
+  return "Catalog";
+}
+
+function defaultCatalogSubtitle(source: string): string {
+  if (source === "favorites") return "Movies and shows you've marked as favorites.";
+  if (source === "watchlist") return "Things you've saved to watch later.";
+  if (source === "history") return "Everything you've recently watched.";
+  return "Refine the archive by type, era, rating, or genre.";
+}
+
+export default function Catalog() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const state = useMemo(() => parseCatalogSearchParams(searchParams), [searchParams]);
+  const emptySearchTitle =
+    state.source === "query" && !state.q ? "Search" : defaultCatalogTitle(state.source, state.q);
+
+  useDocumentTitle(emptySearchTitle);
+
+  if (state.source === "query" && !state.q) {
+    return (
+      <section className="page-shell flex min-h-[calc(100dvh-10rem)] flex-col items-center justify-center py-16 text-center">
+        <div className="text-muted-foreground mb-6">
+          <Search className="h-10 w-10" strokeWidth={1.5} />
+        </div>
+        <h1 className="page-title mb-4">Search</h1>
+        <p className="page-subtitle mb-8 max-w-xl text-sm sm:text-base">
+          Find films, series, performances, and rediscover things you forgot you saved.
+        </p>
+        <SearchBar autoFocus prominent />
+      </section>
+    );
+  }
+
+  return (
+    <CatalogResults searchParams={searchParams} setSearchParams={setSearchParams} state={state} />
+  );
+}
+
+function CatalogResults({
+  searchParams,
+  setSearchParams,
+  state,
+}: {
+  searchParams: URLSearchParams;
+  setSearchParams: (nextInit: URLSearchParams) => void;
+  state: ReturnType<typeof parseCatalogSearchParams>;
+}) {
+  const limit = 60;
+  const searchKey = searchParams.toString();
+  const [visibleRangeState, setVisibleRangeState] = useState<{
+    key: string;
+    range: [number, number];
+  }>({
+    key: searchKey,
+    range: [0, limit - 1],
+  });
+  const visibleRange =
+    visibleRangeState.key === searchKey
+      ? visibleRangeState.range
+      : ([0, limit - 1] as [number, number]);
+  const debounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const isHistorySource = state.source === "history";
+  const isCollectionSource =
+    state.source === "library_collection" || state.source === "user_collection";
+  const allowPersonalizedOverlayControls = catalogSourceAllowsOverlay(state.source);
+  const removeHistory = useRemoveHistory();
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [removeConfirmOpen, setRemoveConfirmOpen] = useState(false);
+  const handleVisibleRangeChange = useCallback(
+    (start: number, end: number) => {
+      clearTimeout(debounceRef.current);
+      debounceRef.current = setTimeout(() => {
+        setVisibleRangeState({ key: searchKey, range: [start, end] });
+      }, 50);
+    },
+    [searchKey],
+  );
+
+  useEffect(() => () => clearTimeout(debounceRef.current), []);
+
+  const isQuerySource = state.source === "query" && Boolean(state.q);
+  const { scope: preferredScope, setScope: setPreferredScope } = useSearchMediaScope();
+  // The URL `type` param is the explicit search scope ("all" included as a
+  // sentinel). When it's absent — fresh navigation, bookmark, global search —
+  // the user's preferred scope applies as the default.
+  const hasExplicitScope = !isQuerySource || searchParams.has("type");
+  const effectiveState = useMemo(() => {
+    if (hasExplicitScope || preferredScope === "all") {
+      return state;
+    }
+    return {
+      ...state,
+      query_definition: { ...state.query_definition, media_scope: preferredScope },
+    };
+  }, [hasExplicitScope, preferredScope, state]);
+  const buildSearchHref = useCallback(
+    (query: string) => buildCatalogQueryUpdateHref(effectiveState, query),
+    [effectiveState],
+  );
+
+  const mediaScope = effectiveState.query_definition.media_scope;
+  const activeChipScope: SearchMediaScope =
+    mediaScope === "audiobook" ? "audiobook" : mediaScope ? "video" : "all";
+  const handleChipScopeChange = useCallback(
+    (scope: SearchMediaScope) => {
+      setPreferredScope(scope);
+      const next = new URLSearchParams(searchParams);
+      next.set("type", scope);
+      setSearchParams(next);
+    },
+    [searchParams, setPreferredScope, setSearchParams],
+  );
+
+  const showExactResultCount = state.source !== "section" && !isQuerySource;
+  const catalogQuery = useCatalogWindow(effectiveState, {
+    limit,
+    visibleRange,
+    includeTotal: showExactResultCount,
+  });
+  const canRequest = useCanRequest();
+  // Add a short TMDB debounce on top of SearchBar's input debounce so the
+  // TMDB plugin isn't hit at the same cadence as the local library query.
+  const tmdbDebouncedQ = useDebounce(state.q ?? "", REQUEST_SEARCH_DEBOUNCE_MS);
+  const tmdbQuery = useRequestSearch("all", tmdbDebouncedQ, 1, {
+    enabled: canRequest.discoveryEnabled && isQuerySource,
+    requireProfile: true,
+    staleTime: 5 * 60 * 1000,
+  });
+  const tmdbMissingCount =
+    tmdbQuery.data?.results?.filter((result) => result.availability !== "available").length ?? 0;
+  const libraryHasResults = (catalogQuery.data?.totalItems ?? 0) > 0;
+  const libraryEmpty = !catalogQuery.isLoading && !libraryHasResults;
+  // When the library is empty and the request section will (or might) render,
+  // hide ItemGrid entirely. The previous approach pinned ItemGrid's `loading`
+  // prop to true, which renders 24 skeleton tiles forever above the section.
+  const tmdbMayRescueLibrary =
+    isQuerySource &&
+    libraryEmpty &&
+    (canRequest.isResolving ||
+      (canRequest.discoveryEnabled && (tmdbQuery.isLoading || tmdbMissingCount > 0)));
+  const loadedHistoryItems = useMemo(() => {
+    if (!isHistorySource) {
+      return [] as BrowseItem[];
+    }
+    const seen = new Set<string>();
+    const items: BrowseItem[] = [];
+    (catalogQuery.data?.pages ?? new Map<number, BrowseItem[]>()).forEach((page) => {
+      page.forEach((item) => {
+        if (seen.has(item.content_id)) {
+          return;
+        }
+        seen.add(item.content_id);
+        items.push(item);
+      });
+    });
+    return items;
+  }, [catalogQuery.data?.pages, isHistorySource]);
+  const selectedHistoryItems = useMemo(
+    () => loadedHistoryItems.filter((item) => selectedIds.has(item.content_id)),
+    [loadedHistoryItems, selectedIds],
+  );
+  const selectedHistoryTargets = useMemo(
+    () => selectedHistoryItems.map((item) => buildHistoryRemovalTarget(item.content_id, item.type)),
+    [selectedHistoryItems],
+  );
+  const title =
+    catalogQuery.data?.title ?? state.title ?? defaultCatalogTitle(state.source, state.q);
+
+  useDocumentTitle(title);
+
+  useEffect(() => {
+    setSelectionMode(false);
+    setSelectedIds(new Set());
+    setRemoveConfirmOpen(false);
+  }, [searchKey, isHistorySource]);
+
+  const toggleHistorySelection = useCallback((item: BrowseItem) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(item.content_id)) {
+        next.delete(item.content_id);
+      } else {
+        next.add(item.content_id);
+      }
+      return next;
+    });
+  }, []);
+
+  const totalItems = catalogQuery.data?.totalItems ?? 0;
+  // For an in-app search the count reflects local library hits only; requestable
+  // matches live in a separate section, so scope the label to avoid a "0 results"
+  // reading while an outside-library result is visible.
+  const resultNoun =
+    state.source === "query" ? "in library" : `result${totalItems === 1 ? "" : "s"}`;
+
+  return (
+    <div className="page-shell space-y-6 py-4 sm:py-6">
+      <header className="page-header">
+        <div className="space-y-3">
+          <h1 className="page-title text-[clamp(2rem,5vw,3.5rem)]">{title}</h1>
+          <p className="page-subtitle text-sm sm:text-base">
+            {defaultCatalogSubtitle(state.source)}
+          </p>
+        </div>
+        <div className="items-baseline gap-3 sm:flex">
+          <div className="hidden h-8 w-px bg-current opacity-15 sm:block" />
+          {showExactResultCount ? (
+            <div className="text-right tabular-nums" role="status" aria-live="polite">
+              <span className="hidden text-3xl font-extralight tracking-tight sm:inline">
+                {totalItems}
+              </span>
+              <span className="text-muted-foreground ml-1.5 hidden text-xs font-medium tracking-widest uppercase sm:inline">
+                {resultNoun}
+              </span>
+              <span className="text-muted-foreground text-xs sm:hidden">
+                {totalItems} {resultNoun}
+              </span>
+            </div>
+          ) : null}
+        </div>
+      </header>
+
+      {state.source === "query" ? (
+        <div className="flex flex-col items-center gap-3">
+          <SearchBar
+            prominent
+            initialQuery={state.q ?? ""}
+            autoFocus
+            buildSearchHref={buildSearchHref}
+          />
+          <SearchScopeChips activeScope={activeChipScope} onScopeChange={handleChipScopeChange} />
+        </div>
+      ) : null}
+
+      <CatalogFiltersPanel
+        state={effectiveState}
+        onStateChange={(nextState) => {
+          const nextSearchParams = buildCatalogFilterSearchParams(nextState);
+          if (nextSearchParams.toString() !== searchParams.toString()) {
+            setSearchParams(nextSearchParams);
+          }
+        }}
+        allowLibrarySelection={!isCollectionSource}
+        allowPersonalizedFilters={allowPersonalizedOverlayControls}
+        allowPersonalizedSorts={allowPersonalizedOverlayControls}
+      />
+
+      {isHistorySource && (
+        <section className="surface-panel flex flex-col gap-3 rounded-2xl border-0 p-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="space-y-1">
+            <p className="text-sm font-semibold">Watch History</p>
+            <p className="text-muted-foreground text-xs sm:text-sm">
+              Removing items clears watch history, watched status, and resume progress for this
+              profile.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            {!selectionMode ? (
+              <Button variant="outline" size="sm" onClick={() => setSelectionMode(true)}>
+                <CheckSquare className="size-4" />
+                Select
+              </Button>
+            ) : (
+              <>
+                <span className="text-muted-foreground text-sm">{selectedIds.size} selected</span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() =>
+                    setSelectedIds(new Set(loadedHistoryItems.map((item) => item.content_id)))
+                  }
+                >
+                  Select Loaded
+                </Button>
+                <Button variant="ghost" size="sm" onClick={() => setSelectedIds(new Set())}>
+                  Clear
+                </Button>
+                <Button
+                  variant="destructive"
+                  size="sm"
+                  disabled={selectedHistoryTargets.length === 0}
+                  onClick={() => setRemoveConfirmOpen(true)}
+                >
+                  <Trash2 className="size-4" />
+                  Remove Selected
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    setSelectionMode(false);
+                    setSelectedIds(new Set());
+                  }}
+                >
+                  <X className="size-4" />
+                  Done
+                </Button>
+              </>
+            )}
+          </div>
+        </section>
+      )}
+
+      {tmdbMayRescueLibrary ? null : (
+        <ItemGrid
+          totalItems={catalogQuery.data?.totalItems ?? 0}
+          pages={catalogQuery.data?.pages ?? new Map()}
+          pageSize={limit}
+          loading={catalogQuery.isLoading}
+          onVisibleRangeChange={handleVisibleRangeChange}
+          selectionMode={isHistorySource && selectionMode}
+          selectedIds={selectedIds}
+          onToggleSelect={toggleHistorySelection}
+        />
+      )}
+
+      {isQuerySource && canRequest.discoveryEnabled ? (
+        <RequestToAddSection
+          variant="grid"
+          query={tmdbDebouncedQ}
+          libraryHadHits={libraryHasResults}
+        />
+      ) : null}
+
+      <ConfirmDialog
+        open={removeConfirmOpen}
+        onOpenChange={setRemoveConfirmOpen}
+        title={historyRemovalDialogTitle(selectedHistoryTargets)}
+        description={historyRemovalDialogDescription(selectedHistoryTargets)}
+        confirmLabel="Remove"
+        variant="destructive"
+        isPending={removeHistory.isPending}
+        onConfirm={() => {
+          removeHistory.mutate(selectedHistoryTargets, {
+            onSuccess: () => {
+              setRemoveConfirmOpen(false);
+              setSelectionMode(false);
+              setSelectedIds(new Set());
+            },
+          });
+        }}
+      />
+    </div>
+  );
+}

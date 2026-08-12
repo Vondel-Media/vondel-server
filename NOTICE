@@ -1,0 +1,15 @@
+Vondel Server
+=============
+
+Vondel is an independent hard fork of Silo Server, based initially on upstream
+revision 1dcdd4b2 from https://github.com/Silo-Server/silo-server.
+
+The source remains licensed under AGPL-3.0-or-later. Existing copyright and
+license notices are retained. Vondel's changes include a new project/module
+identity, executable name, defaults, deployment examples, documentation, and
+original visual assets.
+
+Vondel is not affiliated with or endorsed by Silo Media L.L.C. Silo names that
+remain in protocol headers, discovery records, plugin identifiers, migration
+keys, or environment variables are retained solely for interoperability and
+safe upgrades.

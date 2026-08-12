@@ -1,0 +1,462 @@
+package metadata
+
+import (
+	"context"
+
+	"github.com/Vondel-Media/vondel-server/internal/models"
+)
+
+// RefreshMode determines how the pipeline processes an item.
+type RefreshMode int
+
+const (
+	ModeInitialMatch     RefreshMode = iota // New file discovered by scanner
+	ModeScheduledRefresh                    // Background periodic refresh
+	ModeManualRefresh                       // User-triggered refresh
+	ModeIdentify                            // User manually identified item
+)
+
+// MergeMode determines how provider results merge into existing items.
+type MergeMode int
+
+const (
+	MergeFillEmpty       MergeMode = iota // Only fill zero/empty fields
+	MergeReplaceUnlocked                  // Replace all unlocked fields
+)
+
+// MetadataField identifies a lockable metadata field.
+type MetadataField int
+
+const (
+	FieldName MetadataField = iota
+	FieldOverview
+	FieldGenres
+	FieldStudios
+	FieldCast
+	FieldCrew
+	FieldRating
+	FieldRuntime
+	FieldTags
+	FieldContentRating
+	FieldImages
+	FieldAirSchedule
+	FieldVideos
+	// FieldReleaseDates locks Year, ReleaseDate, and First/LastAirDate so a
+	// refresh (or an NFO at priority 1) cannot overwrite manual corrections.
+	FieldReleaseDates
+)
+
+// RefreshPriority controls queue ordering.
+type RefreshPriority int
+
+const (
+	PriorityHigh   RefreshPriority = 0 // Manual refresh, identify
+	PriorityNormal RefreshPriority = 1 // Newly matched items
+	PriorityLow    RefreshPriority = 2 // Scheduled background refresh
+)
+
+// ProcessRequest is the unified input to MetadataService.Process().
+type ProcessRequest struct {
+	ContentID   string            // Existing item (refresh/identify) or empty (new match)
+	Hints       *MatchHints       // From scanner (initial match only)
+	ProviderIDs map[string]string // From user selection (identify only)
+	FolderID    string            // Which library folder
+	Language    string            // ISO 639-1 metadata language (resolved from folder)
+	Mode        RefreshMode
+	// AdoptLanguage makes Language the item's new canonical metadata
+	// language: the base row is rewritten in Language and
+	// default_metadata_language is restamped, instead of routing a
+	// non-canonical language to the localization tables. Set by
+	// folder-scoped manual refreshes when the library's configured
+	// language differs from the item's stamp, so changing a library's
+	// metadata language actually re-fetches titles/overviews.
+	AdoptLanguage            bool
+	recordedStaleProviderIDs providerIDValueSet
+}
+
+// ProcessResult is the output of MetadataService.Process().
+type ProcessResult struct {
+	ContentID string
+	IsNew     bool // True if this was an initial match (new item created)
+	Updated   bool // True if any fields were changed
+	Decision  *MatchDecision
+}
+
+// MatchDecision is a bounded, persistence-safe explanation of an automatic
+// matcher outcome. It intentionally excludes artwork and provider payloads.
+type MatchDecision struct {
+	Outcome        MatchOutcome             `json:"outcome"`
+	CandidateCount int                      `json:"candidate_count"`
+	Threshold      float64                  `json:"threshold"`
+	TopCandidates  []MatchDecisionCandidate `json:"top_candidates,omitempty"`
+}
+
+type MatchDecisionCandidate struct {
+	Title        string            `json:"title"`
+	MatchedTitle string            `json:"matched_title,omitempty"`
+	Year         int               `json:"year,omitempty"`
+	ProviderIDs  map[string]string `json:"provider_ids,omitempty"`
+	Sources      []string          `json:"sources,omitempty"`
+	Score        float64           `json:"score"`
+	Reasons      []string          `json:"reasons,omitempty"`
+}
+
+type MatchFailure struct {
+	Kind     MatchOutcome
+	Message  string
+	Decision *MatchDecision
+}
+
+// MatchOutcome is the stable matcher/queue failure taxonomy exposed in
+// bounded diagnostics. Keep additions backward-compatible with persisted
+// failure_kind values and the admin API.
+type MatchOutcome string
+
+const (
+	MatchOutcomeMatched               MatchOutcome = "matched"
+	MatchOutcomeNoCandidates          MatchOutcome = "no_candidates"
+	MatchOutcomeCandidateRejected     MatchOutcome = "candidate_rejected"
+	MatchOutcomeTrustedIDConflict     MatchOutcome = "trusted_id_conflict"
+	MatchOutcomeTrustedIDTypeMismatch MatchOutcome = "trusted_id_type_mismatch"
+	MatchOutcomeMetadataEmpty         MatchOutcome = "metadata_empty"
+	MatchOutcomeProviderTransient     MatchOutcome = "provider_transient"
+	MatchOutcomeProviderPermanent     MatchOutcome = "provider_permanent"
+)
+
+// MatchHints carries scanner-extracted data into the pipeline.
+// Adapted from matcher.MatchHints with FilePath added for local providers.
+type MatchHints struct {
+	ContentID                 string
+	FileHash                  string
+	TmdbID                    string
+	TvdbID                    string
+	ImdbID                    string
+	Title                     string
+	Year                      int
+	Type                      string // "movie" or "series"
+	SeasonNum                 int
+	EpisodeNum                int
+	HintSource                string // "xattr", "nfo", "folder", "filename"
+	FilePath                  string // Absolute path to media file (legacy local-provider field)
+	RepresentativeFilePath    string
+	ObservedRootPath          string
+	AllGroupFilePaths         []string
+	PrimarySidecarSearchPaths []string
+	// AlternateIdentities are independently parsed title/year hypotheses from
+	// the filename and surrounding directories. They are tried only after the
+	// primary scanner identity fails, keeping provider traffic bounded while
+	// allowing a good filename to recover from a stale or release-like folder.
+	AlternateIdentities []MatchIdentityHint
+}
+
+type MatchIdentityHint struct {
+	Title  string
+	Year   int
+	Source string
+}
+
+// SearchQuery is passed to SearchProvider.Search().
+type SearchQuery struct {
+	Title                     string
+	Author                    string // optional creator hint (e.g. ebook author) folded into the search query
+	Year                      int
+	ContentType               string            // media_items.type value
+	ProviderIDs               map[string]string // Accumulated IDs from prior providers
+	Language                  string            // ISO 639-1 code from library preference
+	FilePath                  string
+	RepresentativeFilePath    string
+	ObservedRootPath          string
+	AllGroupFilePaths         []string
+	PrimarySidecarSearchPaths []string
+}
+
+// SearchResult is returned from SearchProvider.Search().
+type SearchResult struct {
+	Name             string
+	OriginalTitle    string
+	TitleAliases     []TitleAlias
+	TitleLanguage    string
+	TitleIsFallback  bool
+	OriginalLanguage string
+	Year             int
+	ProviderIDs      map[string]string
+	ImageURL         string
+	Overview         string
+	Provider         string // Slug of the provider that returned this
+}
+
+// TitleAlias is a provider-confirmed title for the same work.
+type TitleAlias struct {
+	Title    string `json:"title"`
+	Language string `json:"language,omitempty"`
+	Kind     string `json:"kind"`
+	Provider string `json:"provider,omitempty"`
+}
+
+const (
+	titleAliasKindOriginal  = "original"
+	titleAliasKindLocalized = "localized"
+	matchContentTypeMovie   = "movie"
+	matchContentTypeSeries  = "series"
+)
+
+// MetadataRequest is passed to MetadataProvider.GetMetadata().
+type MetadataRequest struct {
+	ProviderIDs               map[string]string
+	ContentType               string
+	Language                  string
+	FilePath                  string // Populated for local providers, empty for remote
+	RepresentativeFilePath    string
+	ObservedRootPath          string
+	AllGroupFilePaths         []string
+	PrimarySidecarSearchPaths []string
+	GroupTitle                string
+	GroupYear                 int
+}
+
+// PersonDetailRequest is passed to person detail lookups.
+type PersonDetailRequest struct {
+	ProviderIDs map[string]string
+	Language    string
+}
+
+// PersonDetailResult carries person-level metadata from a provider.
+type PersonDetailResult struct {
+	Name            string
+	SortName        string
+	Bio             string
+	BirthDate       string
+	DeathDate       string
+	Birthplace      string
+	Homepage        string
+	PhotoPath       string
+	PhotoSourcePath string
+	PhotoThumbhash  string
+	ProviderIDs     map[string]string
+}
+
+// MetadataResult carries structured metadata from a single provider.
+type MetadataResult struct {
+	HasMetadata          bool
+	ProviderIDs          map[string]string
+	Title                string
+	OriginalTitle        string
+	SortTitle            string
+	Overview             string
+	Tagline              string
+	Year                 int
+	Runtime              int
+	Genres               []string
+	Studios              []string
+	Networks             []string
+	Countries            []string
+	Keywords             []string
+	OriginalLanguage     string
+	TitleAliases         []TitleAlias
+	TitleAliasesComplete bool
+	TitleLanguage        string
+	TitleIsFallback      bool
+	// titleAliasProviders records whether each contributing provider declared
+	// its aliases to be an authoritative snapshot. False means merge-only,
+	// which is the safe default for legacy plugins and partial responses.
+	titleAliasProviders map[string]bool
+	// quarantinedProviderIDKeys prevents unresolved conflicting IDs from being
+	// reintroduced by later provider details or durable merge.
+	quarantinedProviderIDKeys map[string]struct{}
+	// replacedProviderIDKeys forces an owning-provider consensus replacement to
+	// overwrite the corresponding stored provider-ID column during merge.
+	replacedProviderIDKeys map[string]struct{}
+	// recordedStaleProviderIDs contains provider values known dead before this
+	// refresh and suppresses them when durable state is merged.
+	recordedStaleProviderIDs providerIDValueSet
+	// sameRunStaleProviderIDs contains identity values that 404ed during this
+	// refresh and prevents them from being persisted by the same operation.
+	sameRunStaleProviderIDs providerIDValueSet
+	ContentRating           string
+	Ratings                 Ratings
+	People                  []models.ItemPerson
+	// Images (S3 paths or URLs).
+	PosterPath        string
+	PosterThumbhash   string
+	BackdropPath      string
+	BackdropThumbhash string
+	LogoPath          string
+	// Series-specific
+	ReleaseDate  string
+	SeasonCount  int
+	FirstAirDate string
+	LastAirDate  string
+	AirTime      string
+	AirTimezone  string
+	// ShowStatus is the publication/airing status ("Ongoing", "Completed",
+	// "Continuing", "Ended") when the provider reports one.
+	ShowStatus string
+	// Videos are remote promotional/supplemental videos (trailers, teasers,
+	// ...) hosted on external sites. Accumulated across providers with
+	// (Provider, ProviderKey) dedup, gated by FieldVideos and the library's
+	// trailer_kinds allow-list at persist time.
+	Videos []RemoteVideo
+}
+
+// RemoteVideo describes a provider-reported external video (YouTube trailer
+// etc.). It mirrors the SDK's VideoRecord and persists as an item_videos row.
+type RemoteVideo struct {
+	Provider    string // provider slug that returned this video
+	ProviderKey string // provider-native video id (dedup key)
+	Kind        models.ExtraKind
+	Site        string // hosting site, e.g. "youtube"
+	SiteKey     string // site-native video key (YouTube video id)
+	Name        string
+	Language    string // ISO 639-1, empty when unknown
+	IsOfficial  bool
+	SizeHint    int    // vertical resolution hint (e.g. 1080), 0 when unknown
+	PublishedAt string // RFC 3339, empty when unknown
+}
+
+// Ratings holds ratings from multiple sources.
+type Ratings struct {
+	IMDB       float64
+	TMDB       float64
+	RTCritic   float64
+	RTAudience float64
+}
+
+// ImageRequest is passed to ImageProvider.GetImages().
+type ImageRequest struct {
+	ProviderIDs map[string]string
+	ContentType string
+	Language    string
+	// Local sidecar context (additive; empty for purely remote providers).
+	// RepresentativeFilePath is the group's representative media file,
+	// AllGroupFilePaths are every file in the content group, and
+	// PrimarySidecarSearchPaths are directories already validated as safe for
+	// directory-level sidecars (single-content observed roots).
+	RepresentativeFilePath    string
+	AllGroupFilePaths         []string
+	PrimarySidecarSearchPaths []string
+}
+
+// RemoteImage describes an available image from a provider.
+type RemoteImage struct {
+	ProviderID string // Slug of the provider that returned this image
+	URL        string
+	Type       ImageType
+	Language   string
+	Width      int
+	Height     int
+	Rating     float64 // Vote average for ordering
+}
+
+// ImageType classifies image purpose.
+type ImageType int
+
+const (
+	ImagePoster ImageType = iota
+	ImageBackdrop
+	ImageLogo
+	ImageStill // Episode stills
+	ImageProfile
+)
+
+// CacheImageRequest describes an image to be cached. For season posters
+// and episode stills, ContentID is the parent series's ID and the
+// SeasonNumber / EpisodeNumber fields scope the S3 key so siblings do not
+// collide. Both pointers are nil for item-level images.
+type CacheImageRequest struct {
+	SourceURL     string
+	ProviderID    string
+	ContentType   string // "movies" or "series"
+	ContentID     string
+	ImageType     ImageType
+	SeasonNumber  *int
+	EpisodeNumber *int
+	Language      string
+	// KeyDiscriminator, when set, is inserted into the S3 key between the
+	// content ID and the image type (e.g. the 8-hex content hash of a local
+	// sidecar file) so re-cached art rotates to a fresh key.
+	KeyDiscriminator string
+}
+
+// CacheImageResult is returned by ImageCacher on success.
+type CacheImageResult struct {
+	BasePath     string // image-type prefix retained for legacy callers
+	OriginalPath string // exact immutable original-variant object key
+	Revision     string // content revision shared by all generated variants
+	Thumbhash    string // base64-encoded
+	Ext          string // encoded file extension including dot
+
+	UploadedVariants int
+	ExistingVariants int
+}
+
+// ImageCacher caches a remote image to object storage.
+type ImageCacher interface {
+	CacheImage(ctx context.Context, req CacheImageRequest) (*CacheImageResult, error)
+}
+
+// ImageByteCacher caches an image already read into memory (e.g. a local
+// sidecar file) to object storage. Implemented by imagecache.Cacher alongside
+// ImageCacher; the processor type-asserts it for file:// sources.
+type ImageByteCacher interface {
+	CacheImageBytes(ctx context.Context, data []byte, req CacheImageRequest) (*CacheImageResult, error)
+}
+
+type ImageCacheJobEnqueuer interface {
+	Enqueue(ctx context.Context, in EnqueueImageCacheJobInput) error
+	EnqueueBatch(ctx context.Context, inputs []EnqueueImageCacheJobInput) (int, error)
+}
+
+// SeasonsRequest is passed to EpisodeProvider.GetSeasons().
+type SeasonsRequest struct {
+	ProviderIDs map[string]string
+	ContentType string
+	Language    string
+	// Local sidecar context (additive, internal — mirrors MetadataRequest).
+	// SeriesRootPaths are directories already validated as safe for
+	// directory-level sidecars (the series root); SeasonDirectoryPaths maps
+	// each directory-derived season number to its candidate directories.
+	// Both are empty for purely remote providers, which key off ProviderIDs.
+	SeriesRootPaths      []string
+	SeasonDirectoryPaths map[int][]string
+}
+
+// EpisodesRequest is passed to EpisodeProvider.GetEpisodes().
+type EpisodesRequest struct {
+	ProviderIDs  map[string]string
+	SeasonNumber int
+	Language     string
+	// Local sidecar context (additive, internal). SeriesRootPaths as on
+	// SeasonsRequest; EpisodeFilePaths maps each filename-derived episode
+	// number within SeasonNumber to that episode's media file paths.
+	SeriesRootPaths  []string
+	EpisodeFilePaths map[int][]string
+}
+
+// SeasonResult carries season data from a provider.
+type SeasonResult struct {
+	ContentID        string
+	SeasonNumber     int
+	Title            string
+	Overview         string
+	AirDate          string
+	PosterPath       string
+	PosterSourcePath string
+	PosterThumbhash  string
+	Episodes         []EpisodeResult
+}
+
+// EpisodeResult carries episode data from a provider.
+type EpisodeResult struct {
+	ContentID       string
+	ProviderIDs     map[string]string
+	SeasonNumber    int
+	EpisodeNumber   int
+	Title           string
+	Overview        string
+	AirDate         string
+	Runtime         int
+	Ratings         Ratings
+	StillPath       string
+	StillSourcePath string
+	StillThumbhash  string
+}

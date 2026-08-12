@@ -1,0 +1,600 @@
+package jellycompat
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+
+	"github.com/Vondel-Media/vondel-server/internal/catalog"
+	"github.com/Vondel-Media/vondel-server/internal/config"
+	"github.com/Vondel-Media/vondel-server/internal/models"
+)
+
+func TestHandleItemImageAcceptsSignedTagWithoutSessionOrCache(t *testing.T) {
+	upstreamCalled := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalled = true
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer upstream.Close()
+
+	codec := NewResourceIDCodec()
+	contentID := "movie-1"
+	routeID := codec.EncodeStringID(EncodedIDItem, contentID)
+	updatedAt := time.Date(2026, 5, 26, 12, 0, 0, 0, time.UTC)
+	item := &models.MediaItem{
+		ContentID:       contentID,
+		PosterPath:      upstream.URL,
+		PosterThumbhash: "poster-thumbhash",
+		UpdatedAt:       updatedAt,
+	}
+	cfg := &config.Config{Auth: config.AuthConfig{JWTSecret: "image-secret"}}
+	tag := newMapper(codec, cfg).itemFromList(upstreamListItem{
+		ContentID:       contentID,
+		Type:            "movie",
+		Title:           "Movie",
+		PosterURL:       item.PosterPath,
+		PosterPath:      item.PosterPath,
+		PosterThumbhash: item.PosterThumbhash,
+		UpdatedAt:       item.UpdatedAt,
+	}, false, nil, nil).ImageTags["Primary"]
+	h := &ImagesHandler{
+		codec:     codec,
+		images:    NewImageCache(time.Hour, func() time.Time { return updatedAt }),
+		itemRepo:  fakeImageItemRepo{item: item},
+		imageTags: newImageTagSigner(cfg.Auth.JWTSecret),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/Items/"+routeID+"/Images/Primary?fillHeight=267&fillWidth=474&quality=96&tag="+tag, nil)
+	req = withImageRouteParams(req, routeID, "Primary")
+	rec := httptest.NewRecorder()
+
+	h.HandleItemImage(rec, req)
+
+	assertImageRedirect(t, rec, upstream.URL)
+	if upstreamCalled {
+		t.Fatal("compat image route proxied the upstream image instead of redirecting")
+	}
+	if cached, ok := h.images.LookupSized(routeID, "Primary", "", compatRequestImageSize(req, "Primary")); !ok || cached == "" {
+		t.Fatal("signed-tag image URL was not cached after resolution")
+	}
+}
+
+func TestHandleItemImageProxiesInfuseSignedTagWithoutSessionOrCache(t *testing.T) {
+	upstreamCalled := false
+	var gotIfNoneMatch string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalled = true
+		gotIfNoneMatch = r.Header.Get("If-None-Match")
+		w.Header().Set("Cache-Control", "public, max-age=14400")
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.Header().Set("ETag", `"poster-v1"`)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("image-bytes"))
+	}))
+	defer upstream.Close()
+
+	codec := NewResourceIDCodec()
+	contentID := "movie-1"
+	routeID := codec.EncodeStringID(EncodedIDItem, contentID)
+	updatedAt := time.Date(2026, 5, 26, 12, 0, 0, 0, time.UTC)
+	item := &models.MediaItem{
+		ContentID:       contentID,
+		PosterPath:      upstream.URL,
+		PosterThumbhash: "poster-thumbhash",
+		UpdatedAt:       updatedAt,
+	}
+	cfg := &config.Config{Auth: config.AuthConfig{JWTSecret: "image-secret"}}
+	tag := newMapper(codec, cfg).itemFromList(upstreamListItem{
+		ContentID:       contentID,
+		Type:            "movie",
+		Title:           "Movie",
+		PosterURL:       item.PosterPath,
+		PosterPath:      item.PosterPath,
+		PosterThumbhash: item.PosterThumbhash,
+		UpdatedAt:       item.UpdatedAt,
+	}, false, nil, nil).ImageTags["Primary"]
+	h := &ImagesHandler{
+		codec:      codec,
+		images:     NewImageCache(time.Hour, func() time.Time { return updatedAt }),
+		itemRepo:   fakeImageItemRepo{item: item},
+		imageTags:  newImageTagSigner(cfg.Auth.JWTSecret),
+		httpClient: upstream.Client(),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/Items/"+routeID+"/Images/Primary?fillHeight=267&fillWidth=474&quality=96&tag="+compatImageProxyTag(tag), nil)
+	req.Header.Set("If-None-Match", `"poster-v1"`)
+	req.Header.Set("User-Agent", "Infuse-Direct/8.4.6")
+	req = withImageRouteParams(req, routeID, "Primary")
+	rec := httptest.NewRecorder()
+
+	h.HandleItemImage(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s; want 200", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != "image-bytes" {
+		t.Fatalf("body = %q, want image-bytes", got)
+	}
+	if got := rec.Header().Get("Location"); got != "" {
+		t.Fatalf("Location = %q, want empty", got)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "image/jpeg" {
+		t.Fatalf("Content-Type = %q, want image/jpeg", got)
+	}
+	if got := rec.Header().Get("Cache-Control"); got != compatImageRouteCacheControl {
+		t.Fatalf("Cache-Control = %q, want %q", got, compatImageRouteCacheControl)
+	}
+	if got := rec.Header().Get("CDN-Cache-Control"); got != "private, no-store, no-cache, max-age=0" {
+		t.Fatalf("CDN-Cache-Control = %q, want private, no-store, no-cache, max-age=0", got)
+	}
+	if got := rec.Header().Get("X-Accel-Expires"); got != "0" {
+		t.Fatalf("X-Accel-Expires = %q, want 0", got)
+	}
+	if got := gotIfNoneMatch; got != `"poster-v1"` {
+		t.Fatalf("forwarded If-None-Match = %q, want poster-v1", got)
+	}
+	if !upstreamCalled {
+		t.Fatal("Infuse compat image route did not proxy the upstream image")
+	}
+}
+
+func TestHandleItemImageProxyRouteIDUsesCanonicalItemAndProxy(t *testing.T) {
+	upstreamCalled := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalled = true
+		w.Header().Set("Content-Type", "image/webp")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("proxy-route-image"))
+	}))
+	defer upstream.Close()
+
+	codec := NewResourceIDCodec()
+	contentID := "movie-1"
+	routeID := codec.EncodeStringID(EncodedIDItem, contentID)
+	proxyRouteID := compatImageProxyRouteID(codec, routeID)
+	updatedAt := time.Date(2026, 5, 26, 12, 0, 0, 0, time.UTC)
+	item := &models.MediaItem{
+		ContentID:       contentID,
+		PosterPath:      upstream.URL,
+		PosterThumbhash: "poster-thumbhash",
+		UpdatedAt:       updatedAt,
+	}
+	cfg := &config.Config{Auth: config.AuthConfig{JWTSecret: "image-secret"}}
+	tag := newMapper(codec, cfg).itemFromList(upstreamListItem{
+		ContentID:       contentID,
+		Type:            "movie",
+		Title:           "Movie",
+		PosterURL:       item.PosterPath,
+		PosterPath:      item.PosterPath,
+		PosterThumbhash: item.PosterThumbhash,
+		UpdatedAt:       item.UpdatedAt,
+	}, false, nil, nil).ImageTags["Primary"]
+	h := &ImagesHandler{
+		codec:      codec,
+		images:     NewImageCache(time.Hour, func() time.Time { return updatedAt }),
+		itemRepo:   fakeImageItemRepo{item: item},
+		imageTags:  newImageTagSigner(cfg.Auth.JWTSecret),
+		httpClient: upstream.Client(),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/Items/"+proxyRouteID+"/Images/Primary?fillHeight=267&fillWidth=474&quality=96&tag="+compatImageProxyTag(tag), nil)
+	req = withImageRouteParams(req, proxyRouteID, "Primary")
+	rec := httptest.NewRecorder()
+
+	h.HandleItemImage(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s; want 200", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != "proxy-route-image" {
+		t.Fatalf("body = %q, want proxy-route-image", got)
+	}
+	if got := rec.Header().Get("Location"); got != "" {
+		t.Fatalf("Location = %q, want empty", got)
+	}
+	if cached, ok := h.images.LookupSized(routeID, "Primary", "", compatRequestImageSize(req, "Primary")); !ok || cached == "" {
+		t.Fatal("proxy route image URL was not cached under the canonical route ID")
+	}
+	if !upstreamCalled {
+		t.Fatal("proxy route did not fetch the upstream image")
+	}
+}
+
+func TestHandleItemImageRejectsUnsignedTagWhenSecretBlank(t *testing.T) {
+	codec := NewResourceIDCodec()
+	contentID := "movie-1"
+	routeID := codec.EncodeStringID(EncodedIDItem, contentID)
+	updatedAt := time.Date(2026, 5, 26, 12, 0, 0, 0, time.UTC)
+	item := &models.MediaItem{
+		ContentID:       contentID,
+		PosterPath:      "https://cdn.example.test/poster.jpg",
+		PosterThumbhash: "poster-thumbhash",
+		UpdatedAt:       updatedAt,
+	}
+	tag := newMapper(codec, &config.Config{}).itemFromList(upstreamListItem{
+		ContentID:       contentID,
+		Type:            "movie",
+		Title:           "Movie",
+		PosterURL:       item.PosterPath,
+		PosterPath:      item.PosterPath,
+		PosterThumbhash: item.PosterThumbhash,
+		UpdatedAt:       item.UpdatedAt,
+	}, false, nil, nil).ImageTags["Primary"]
+	h := &ImagesHandler{
+		codec:     codec,
+		itemRepo:  fakeImageItemRepo{item: item},
+		imageTags: newImageTagSigner(""),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/Items/"+routeID+"/Images/Primary?tag="+tag, nil)
+	req = withImageRouteParams(req, routeID, "Primary")
+	rec := httptest.NewRecorder()
+
+	h.HandleItemImage(rec, req)
+
+	// An unsigned/invalid tag must not serve the image. Per the Jellyfin
+	// contract (item-image GETs are anonymous, 200/404 only) the rejection
+	// surfaces as a 404, not a 401.
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, body = %s; want 404", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleItemImageAcceptsSignedCanonicalBackdropTagWithoutSessionOrCache(t *testing.T) {
+	upstreamCalled := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalled = true
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer upstream.Close()
+
+	codec := NewResourceIDCodec()
+	contentID := "series-1"
+	routeID := codec.EncodeStringID(EncodedIDItem, contentID)
+	secret := "image-secret"
+	tag := newImageTagSigner(secret).Tag(
+		imageTagSeed(contentID, "Backdrop", compatCardImageSize, upstream.URL, "", time.Time{}),
+		upstream.URL,
+	)
+	h := &ImagesHandler{
+		codec:  codec,
+		images: NewImageCache(time.Hour, time.Now),
+		itemRepo: fakeImageItemRepo{item: &models.MediaItem{
+			ContentID:    contentID,
+			BackdropPath: upstream.URL,
+		}},
+		imageTags: newImageTagSigner(secret),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/Items/"+routeID+"/Images/Thumb?fillHeight=267&fillWidth=474&quality=96&tag="+tag, nil)
+	req = withImageRouteParams(req, routeID, "Thumb")
+	rec := httptest.NewRecorder()
+
+	h.HandleItemImage(rec, req)
+
+	assertImageRedirect(t, rec, upstream.URL)
+	if upstreamCalled {
+		t.Fatal("compat image route proxied the upstream image instead of redirecting")
+	}
+}
+
+func TestHandleItemImageAcceptsLibraryPosterTagWithoutSessionOrCache(t *testing.T) {
+	upstreamCalled := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalled = true
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer upstream.Close()
+
+	codec := NewResourceIDCodec()
+	libraryID := 1
+	routeID := codec.EncodeIntID(EncodedIDLibrary, int64(libraryID))
+	posterPath := "library-posters/1/original.jpg"
+	secret := "image-secret"
+	tag := newImageTagSigner(secret).Tag(
+		imageTagSeed(routeID, "Primary", compatCardImageSize, posterPath, "", time.Time{}),
+		"",
+	)
+	h := &ImagesHandler{
+		codec:        codec,
+		images:       NewImageCache(time.Hour, time.Now),
+		folderRepo:   fakeImageFolderRepo{folder: &models.MediaFolder{ID: libraryID, PosterPath: posterPath}},
+		posterSigner: fakeLibraryPosterPresigner{url: upstream.URL},
+		imageTags:    newImageTagSigner(secret),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/Items/"+routeID+"/Images/Primary?fillHeight=267&fillWidth=474&quality=96&tag="+tag, nil)
+	req = withImageRouteParams(req, routeID, "Primary")
+	rec := httptest.NewRecorder()
+
+	h.HandleItemImage(rec, req)
+
+	assertImageRedirect(t, rec, upstream.URL)
+	if upstreamCalled {
+		t.Fatal("compat image route proxied the upstream image instead of redirecting")
+	}
+}
+
+func TestHandleItemImageAcceptsLegacyCachedURLTagWithoutRouteFallback(t *testing.T) {
+	upstreamCalled := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalled = true
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer upstream.Close()
+
+	codec := NewResourceIDCodec()
+	routeID := codec.EncodeStringID(EncodedIDItem, "movie-1")
+	cache := NewImageCache(time.Hour, time.Now)
+	cache.RememberSized(routeID, "Primary", upstream.URL, compatCardImageSize)
+	h := &ImagesHandler{
+		codec:     codec,
+		images:    cache,
+		imageTags: newImageTagSigner("image-secret"),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/Items/"+routeID+"/Images/Primary?tag="+tagValue(upstream.URL), nil)
+	req = withImageRouteParams(req, routeID, "Primary")
+	rec := httptest.NewRecorder()
+
+	h.HandleItemImage(rec, req)
+
+	assertImageRedirect(t, rec, upstream.URL)
+	if upstreamCalled {
+		t.Fatal("compat image route proxied the upstream image instead of redirecting")
+	}
+}
+
+func TestHandleItemImageRevalidatesTagBeforeRouteCacheHit(t *testing.T) {
+	called := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		_, _ = w.Write([]byte("stale-image"))
+	}))
+	defer upstream.Close()
+
+	codec := NewResourceIDCodec()
+	contentID := "movie-1"
+	routeID := codec.EncodeStringID(EncodedIDItem, contentID)
+	updatedAt := time.Date(2026, 5, 26, 12, 0, 0, 0, time.UTC)
+	item := &models.MediaItem{
+		ContentID:       contentID,
+		PosterPath:      upstream.URL,
+		PosterThumbhash: "poster-thumbhash",
+		UpdatedAt:       updatedAt,
+	}
+	cache := NewImageCache(time.Hour, func() time.Time { return updatedAt })
+	cache.RememberSized(routeID, "Primary", upstream.URL, compatCardImageSize)
+	tag := newMapper(codec, &config.Config{
+		Auth: config.AuthConfig{JWTSecret: "old-secret"},
+	}).itemFromList(upstreamListItem{
+		ContentID:       contentID,
+		Type:            "movie",
+		Title:           "Movie",
+		PosterURL:       item.PosterPath,
+		PosterPath:      item.PosterPath,
+		PosterThumbhash: item.PosterThumbhash,
+		UpdatedAt:       item.UpdatedAt,
+	}, false, nil, nil).ImageTags["Primary"]
+	h := &ImagesHandler{
+		codec:     codec,
+		images:    cache,
+		itemRepo:  fakeImageItemRepo{item: item},
+		imageTags: newImageTagSigner("new-secret"),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/Items/"+routeID+"/Images/Primary?tag="+tag, nil)
+	req = withImageRouteParams(req, routeID, "Primary")
+	rec := httptest.NewRecorder()
+
+	h.HandleItemImage(rec, req)
+
+	// A stale tag (signed with the old secret) must not serve the cached image.
+	// Per the Jellyfin contract the rejection surfaces as a 404, not a 401.
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, body = %s; want 404", rec.Code, rec.Body.String())
+	}
+	if called {
+		t.Fatal("served cached image before validating the signed tag")
+	}
+}
+
+func TestRedirectImageURLRejectsNonHTTPURL(t *testing.T) {
+	h := &ImagesHandler{}
+	req := httptest.NewRequest(http.MethodGet, "/Items/1/Images/Primary", nil)
+	rec := httptest.NewRecorder()
+
+	h.redirectImageURL(rec, req, "catalog/poster.jpg")
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, body = %s; want 502", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Location"); got != "" {
+		t.Fatalf("Location = %q, want empty", got)
+	}
+}
+
+// TestHandleItemImageChapterReturns404WithoutSession verifies an anonymous
+// chapter-image request (no auth, cold cache, no tag) degrades to a 404, not a
+// 401: Silo never stores "Chapter" route art, so the cache misses and the
+// session-fallback now returns NotFound per the Jellyfin contract.
+func TestHandleItemImageChapterReturns404WithoutSession(t *testing.T) {
+	codec := NewResourceIDCodec()
+	contentID := "movie-1"
+	routeID := codec.EncodeStringID(EncodedIDItem, contentID)
+	h := &ImagesHandler{
+		codec:     codec,
+		images:    NewImageCache(time.Hour, time.Now),
+		itemRepo:  fakeImageItemRepo{item: &models.MediaItem{ContentID: contentID}},
+		imageTags: newImageTagSigner("image-secret"),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/Items/"+routeID+"/Images/Chapter/0", nil)
+	routeCtx := chi.NewRouteContext()
+	routeCtx.URLParams.Add("id", routeID)
+	routeCtx.URLParams.Add("imageType", "Chapter")
+	routeCtx.URLParams.Add("index", "0")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, routeCtx))
+	rec := httptest.NewRecorder()
+
+	h.HandleItemImage(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, body = %s; want 404", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Location"); got != "" {
+		t.Fatalf("Location = %q, want empty", got)
+	}
+}
+
+// TestHandleItemImagePrimaryCacheHitRedirectsWithoutSession verifies a warm
+// Primary cache entry serves an anonymous <img> request via redirect, never
+// consulting auth.
+func TestHandleItemImagePrimaryCacheHitRedirectsWithoutSession(t *testing.T) {
+	codec := NewResourceIDCodec()
+	contentID := "movie-1"
+	routeID := codec.EncodeStringID(EncodedIDItem, contentID)
+	upstreamURL := "https://cdn.example.test/poster.jpg"
+	h := &ImagesHandler{
+		codec:     codec,
+		images:    NewImageCache(time.Hour, time.Now),
+		itemRepo:  fakeImageItemRepo{item: &models.MediaItem{ContentID: contentID}},
+		imageTags: newImageTagSigner("image-secret"),
+	}
+	h.images.RememberSized(routeID, "Primary", upstreamURL, compatCardImageSize)
+
+	req := httptest.NewRequest(http.MethodGet, "/Items/"+routeID+"/Images/Primary", nil)
+	req = withImageRouteParams(req, routeID, "Primary")
+	rec := httptest.NewRecorder()
+
+	h.HandleItemImage(rec, req)
+
+	assertImageRedirect(t, rec, upstreamURL)
+}
+
+// serveUserImage issues an avatar request for pathID with the chi "id" route
+// param and no session in context.
+func serveUserImage(h *ImagesHandler, method, pathID string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, "/Users/"+pathID+"/Images/Primary", nil)
+	routeCtx := chi.NewRouteContext()
+	routeCtx.URLParams.Add("id", pathID)
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, routeCtx))
+	rec := httptest.NewRecorder()
+	h.HandleUserImage(rec, req)
+	return rec
+}
+
+// TestHandleUserImageServesPlaceholderWithoutSession verifies the user-avatar
+// route serves a placeholder PNG without a session: it is byte-stable per id and
+// the palette varies across ids (the avatar is now drawn from a bounded fixed
+// palette, so two distinct ids may collide — variety is asserted over a sample).
+func TestHandleUserImageServesPlaceholderWithoutSession(t *testing.T) {
+	h := &ImagesHandler{codec: NewResourceIDCodec()}
+	id := PseudoUserID(1, "profile-1").String()
+
+	rec := serveUserImage(h, http.MethodGet, id)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s; want 200", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "image/png" {
+		t.Fatalf("Content-Type = %q, want image/png", ct)
+	}
+	body := rec.Body.Bytes()
+	if len(body) == 0 {
+		t.Fatal("expected a non-empty avatar body")
+	}
+
+	again := serveUserImage(h, http.MethodGet, id)
+	if got := again.Body.Bytes(); string(got) != string(body) {
+		t.Fatal("avatar bytes for the same path id must be stable across calls")
+	}
+
+	// The palette is bounded, so individual ids may collide; assert variety over
+	// a sample instead of strict per-id divergence.
+	distinct := map[string]struct{}{}
+	for i := 0; i < 12; i++ {
+		out := serveUserImage(h, http.MethodGet, PseudoUserID(i+10, "profile").String())
+		distinct[out.Body.String()] = struct{}{}
+	}
+	if len(distinct) < 2 {
+		t.Fatalf("expected the avatar palette to vary across ids; got %d distinct outputs", len(distinct))
+	}
+}
+
+// TestHandleUserImageHeadRequest verifies the HEAD variant of the anonymous
+// avatar route returns 200 + image/png (the body may be empty for HEAD).
+func TestHandleUserImageHeadRequest(t *testing.T) {
+	h := &ImagesHandler{codec: NewResourceIDCodec()}
+	id := PseudoUserID(1, "profile-1").String()
+
+	rec := serveUserImage(h, http.MethodHead, id)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s; want 200", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "image/png" {
+		t.Fatalf("Content-Type = %q, want image/png", ct)
+	}
+}
+
+func assertImageRedirect(t *testing.T, rec *httptest.ResponseRecorder, wantLocation string) {
+	t.Helper()
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d, body = %s; want 302", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Location"); got != wantLocation {
+		t.Fatalf("Location = %q, want %q", got, wantLocation)
+	}
+	if got := rec.Header().Get("Cache-Control"); got != compatImageRouteCacheControl {
+		t.Fatalf("Cache-Control = %q, want %q", got, compatImageRouteCacheControl)
+	}
+}
+
+type fakeImageItemRepo struct {
+	item *models.MediaItem
+}
+
+func (r fakeImageItemRepo) GetByID(_ context.Context, contentID string) (*models.MediaItem, error) {
+	if r.item != nil && r.item.ContentID == contentID {
+		return r.item, nil
+	}
+	return nil, catalog.ErrItemNotFound
+}
+
+func (r fakeImageItemRepo) EnsureAccessible(context.Context, string, catalog.AccessFilter) error {
+	return nil
+}
+
+type fakeImageFolderRepo struct {
+	folder *models.MediaFolder
+}
+
+func (r fakeImageFolderRepo) GetByID(_ context.Context, id int) (*models.MediaFolder, error) {
+	if r.folder != nil && r.folder.ID == id {
+		return r.folder, nil
+	}
+	return nil, catalog.ErrFolderNotFound
+}
+
+type fakeLibraryPosterPresigner struct {
+	url string
+}
+
+func (p fakeLibraryPosterPresigner) PresignGetURL(context.Context, string, string, time.Duration) (string, error) {
+	return p.url, nil
+}
+
+func (p fakeLibraryPosterPresigner) Bucket() string {
+	return "test-bucket"
+}
+
+func withImageRouteParams(r *http.Request, routeID, imageType string) *http.Request {
+	routeCtx := chi.NewRouteContext()
+	routeCtx.URLParams.Add("id", routeID)
+	routeCtx.URLParams.Add("imageType", imageType)
+	return r.WithContext(context.WithValue(r.Context(), chi.RouteCtxKey, routeCtx))
+}

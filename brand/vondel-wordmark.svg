@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 560" role="img" aria-labelledby="title desc">
+  <title id="title">Vondel wordmark</title>
+  <desc id="desc">The Vondel mark and name.</desc>
+  <g transform="translate(48 48) scale(.453125)">
+    <rect width="1024" height="1024" rx="224" fill="#101827"/>
+    <path d="M184 230h176l152 414 152-414h176L591 816H433L184 230Z" fill="#F05A47"/>
+    <path d="m512 644 79 172H433l79-172Z" fill="#F7E7D4" fill-opacity=".16"/>
+  </g>
+  <text x="590" y="382" fill="#F7F5F0" font-family="Inter, Manrope, Avenir Next, Arial, sans-serif" font-size="292" font-weight="680" letter-spacing="12">VONDEL</text>
+</svg>

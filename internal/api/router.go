@@ -1,0 +1,3627 @@
+// Package api provides the HTTP router and middleware setup for Silo.
+package api
+
+import (
+	"context"
+	"errors"
+	"io/fs"
+	"log/slog"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
+
+	"github.com/Vondel-Media/vondel-server/internal/access"
+	"github.com/Vondel-Media/vondel-server/internal/activitylog"
+	"github.com/Vondel-Media/vondel-server/internal/adminjob"
+	"github.com/Vondel-Media/vondel-server/internal/ai/jobrunner"
+	"github.com/Vondel-Media/vondel-server/internal/ai/llm"
+	"github.com/Vondel-Media/vondel-server/internal/api/handlers"
+	apimw "github.com/Vondel-Media/vondel-server/internal/api/middleware"
+	"github.com/Vondel-Media/vondel-server/internal/auth"
+	"github.com/Vondel-Media/vondel-server/internal/autoscan"
+	"github.com/Vondel-Media/vondel-server/internal/branding"
+	"github.com/Vondel-Media/vondel-server/internal/cache"
+	"github.com/Vondel-Media/vondel-server/internal/catalog"
+	"github.com/Vondel-Media/vondel-server/internal/catalogseed"
+	"github.com/Vondel-Media/vondel-server/internal/clientip"
+	"github.com/Vondel-Media/vondel-server/internal/config"
+	"github.com/Vondel-Media/vondel-server/internal/diagnostics"
+	"github.com/Vondel-Media/vondel-server/internal/downloads"
+	evt "github.com/Vondel-Media/vondel-server/internal/events"
+	"github.com/Vondel-Media/vondel-server/internal/historyimport"
+	"github.com/Vondel-Media/vondel-server/internal/intromarkers"
+	"github.com/Vondel-Media/vondel-server/internal/invitations"
+	"github.com/Vondel-Media/vondel-server/internal/libraryingest"
+	"github.com/Vondel-Media/vondel-server/internal/literaryworks"
+	"github.com/Vondel-Media/vondel-server/internal/logstream"
+	"github.com/Vondel-Media/vondel-server/internal/mail"
+	"github.com/Vondel-Media/vondel-server/internal/markers"
+	"github.com/Vondel-Media/vondel-server/internal/mdblist"
+	"github.com/Vondel-Media/vondel-server/internal/metadata"
+	"github.com/Vondel-Media/vondel-server/internal/metadata/tmdb"
+	metatrakt "github.com/Vondel-Media/vondel-server/internal/metadata/trakt"
+	metadatatranslation "github.com/Vondel-Media/vondel-server/internal/metadata/translation"
+	"github.com/Vondel-Media/vondel-server/internal/nodepool"
+	"github.com/Vondel-Media/vondel-server/internal/notifications"
+	"github.com/Vondel-Media/vondel-server/internal/onboarding"
+	"github.com/Vondel-Media/vondel-server/internal/opslog"
+	"github.com/Vondel-Media/vondel-server/internal/playback"
+	"github.com/Vondel-Media/vondel-server/internal/playback/planstore"
+	"github.com/Vondel-Media/vondel-server/internal/plugins"
+	"github.com/Vondel-Media/vondel-server/internal/policy"
+	"github.com/Vondel-Media/vondel-server/internal/ratelimit"
+	"github.com/Vondel-Media/vondel-server/internal/recommendations"
+	mediarequests "github.com/Vondel-Media/vondel-server/internal/requests"
+	"github.com/Vondel-Media/vondel-server/internal/s3client"
+	"github.com/Vondel-Media/vondel-server/internal/scanner"
+	"github.com/Vondel-Media/vondel-server/internal/scanqueue"
+	"github.com/Vondel-Media/vondel-server/internal/secret"
+	"github.com/Vondel-Media/vondel-server/internal/sections"
+	"github.com/Vondel-Media/vondel-server/internal/settingscontract"
+	"github.com/Vondel-Media/vondel-server/internal/subtitles"
+	subtitleai "github.com/Vondel-Media/vondel-server/internal/subtitles/ai"
+	"github.com/Vondel-Media/vondel-server/internal/subtitles/opensubtitles"
+	"github.com/Vondel-Media/vondel-server/internal/subtitles/subdl"
+	"github.com/Vondel-Media/vondel-server/internal/subtitles/subsource"
+	"github.com/Vondel-Media/vondel-server/internal/taskmanager"
+	"github.com/Vondel-Media/vondel-server/internal/taskmanager/repository"
+	"github.com/Vondel-Media/vondel-server/internal/usercollections"
+	"github.com/Vondel-Media/vondel-server/internal/userstore"
+	"github.com/Vondel-Media/vondel-server/internal/watchstate"
+	watchtrakt "github.com/Vondel-Media/vondel-server/internal/watchsync/providers/trakt"
+	"github.com/Vondel-Media/vondel-server/internal/watchtogether"
+	"github.com/Vondel-Media/vondel-server/internal/webhooksync"
+)
+
+// Dependencies holds all shared dependencies that handlers need.
+type Dependencies struct {
+	Config *config.Config
+	// LiveConfig returns the current hot-reloaded config. May be nil (tests,
+	// worker modes); read through CurrentConfig(), which falls back to Config.
+	LiveConfig func() *config.Config
+	// OnConfigChange registers a callback fired after a live config reload
+	// actually changes the config. May be nil when hot reload is not wired.
+	OnConfigChange               func(fn func(old, updated *config.Config))
+	BootstrapSensitiveConfigured map[string]bool
+	BootstrapSensitiveValues     map[string]string
+	RedisBootstrapAvailable      bool
+	AppContext                   context.Context
+	DB                           *pgxpool.Pool
+	SecretCipher                 *secret.Cipher // at-rest credential cipher (required when DB is set)
+	FrontendFS                   fs.FS
+	S3Public                     *s3client.Client                 // public assets bucket client (may be nil)
+	S3Private                    *s3client.Client                 // private internal bucket client (may be nil)
+	S3UserDB                     *s3client.Client                 // user-db bucket client (may be nil)
+	BrandingService              *branding.Service                // white-label branding (nil when DB unavailable)
+	FolderRepo                   *catalog.FolderRepository        // media folder repository (may be nil)
+	FileRepo                     *scanner.FileRepository          // media file repository (may be nil)
+	Scanner                      *scanner.Scanner                 // scanner instance (may be nil)
+	LibraryIngester              *libraryingest.Executor          // shared library ingest executor (may be nil)
+	ProbeEnsurer                 handlers.PlaybackProbeEnsurer    // on-demand probe repair for playback/detail (may be nil)
+	UserStoreProvider            userstore.UserStoreProvider      // user store provider (may be nil)
+	SessionMgr                   *playback.SessionManager         // playback session manager (may be nil)
+	SkippedRootRepo              *metadata.SkippedRootRepository  // skipped root repository (may be nil)
+	StaleIDRepo                  *metadata.StaleMediaIDRepository // stale media ID repository (may be nil)
+	MovieMatchQueueRepo          *metadata.MovieMatchQueueRepository
+	SeriesRootMatchQueueRepo     *metadata.SeriesRootMatchQueueRepository
+	Refresher                    handlers.AdminMetadataRefresher // metadata refresher (may be nil)
+	NodeRepo                     *nodepool.Repository            // stream node repository (may be nil)
+	ProxyPool                    *nodepool.ProxyPool             // proxy node pool (may be nil)
+	TranscodePool                *nodepool.TranscodePool         // transcode node pool (may be nil)
+	NodePlanner                  *nodepool.Planner               // group/cap-aware node selection (may be nil)
+	SessionSyncer                handlers.PlaybackSessionSyncer  // optional; immediate playback session sync trigger
+	EventBus                     cache.EventBus
+	AdminStatsProvider           handlers.AdminStatsSource
+	Recommender                  recommendations.Recommender // nil when disabled
+	RecWorker                    *recommendations.Worker     // nil when disabled
+	CatalogSearchVectorizer      catalog.CatalogSearchQueryVectorizer
+	RatingsRepo                  *catalog.RatingsRepo
+	PersonRepo                   *catalog.PersonRepository
+	PersonRefreshQueue           handlers.PersonRefreshQueue
+	PersonRefresher              handlers.PersonRefresher
+	RateLimitMW                  *ratelimit.Middleware
+	ClientIPResolver             *clientip.Resolver
+	NodeID                       string
+	LogStreamHub                 *logstream.Hub
+	RealtimeHub                  *notifications.Hub
+	Notifications                *notifications.System // user-facing release notifications (may be nil)
+	PolicySystem                 *policy.System        // policy engine lifecycle (may be nil)
+	EventsHub                    *evt.Hub
+	ScanRegistry                 *evt.ScanRegistry
+	LibraryScanQueue             *scanqueue.Service
+	ActivityLogWriter            activitylog.Writer
+	ActivityLogRepo              *activitylog.Repo
+	OpsLogRepo                   *opslog.Repo
+	FFmpegLogSink                playback.FFmpegLogSink
+	RedisClient                  *redis.Client              // for session listing (may be nil)
+	TaskManager                  *taskmanager.TaskManager   // task manager (may be nil)
+	ArtifactManager              *downloads.ArtifactManager // download prepare-to-file pipeline (may be nil)
+	AdminJobCancelRegistry       *adminjob.CancelRegistry
+	IntroRepository              *intromarkers.Repository
+	IntroAnalyzer                *intromarkers.Analyzer
+	MarkerRegistry               *markers.Registry
+	MarkerResolver               markers.ExternalIDResolver
+	MarkerProviderConfig         *markers.ProviderConfigStore
+	MarkerContributionStore      *markers.ContributionStore
+	MarkerContributionService    *markers.ContributionService
+	WatchProviderService         handlers.WatchProviderService
+	WatchCompletionObserver      watchstate.CompletionObserver
+	PluginService                *plugins.Service
+	PluginHTTPProxy              *plugins.HTTPProxy
+	PluginUserConfig             *plugins.UserConfigStore
+	AuthProviders                []auth.RegisteredProvider
+	// PublicURL is the externally-reachable origin (scheme + host) for this
+	// silo instance. Used to build redirect_uri values handed to OAuth
+	// IdPs. Empty disables the /oauth/{install_id}/{init,callback} routes.
+	PublicURL              string
+	ImageResolver          catalog.ImageResolver             // plugin-based image URL resolver (may be nil)
+	PluginImageResolver    *metadata.PluginImageResolver     // concrete resolver for runtime source registration (may be nil)
+	MetadataService        handlers.MatchMetadataService     // metadata search+process (may be nil)
+	CollectionService      *catalog.LibraryCollectionService // collection service (may be nil)
+	ChapterThumbnailQueuer catalog.ChapterThumbnailQueuer
+	PlaybackRealtimeHub    *playback.RealtimeHub
+	OnUserSessionsRevoked  func(ctx context.Context, userID int)
+	OnServerSettingUpdated func(ctx context.Context, key, value string)
+	RequestServerRestart   func(ctx context.Context) error
+	ServerRestartStatus    *handlers.ServerRestartStatusTracker
+
+	// UserCollectionSync handles per-profile imported collections (TMDB /
+	// Trakt / MDBList) — the user-facing analogue of CollectionService.
+	UserCollectionSync      *usercollections.Service
+	UserCollectionScheduler *usercollections.Scheduler
+
+	// TrendingRefresher refreshes the persisted trending_discover snapshots.
+	// Built in main.go with TMDB wired; its Trakt fetcher is propagated here in
+	// router.go once the Trakt adapter exists (mirrors UserCollectionSync).
+	TrendingRefresher *sections.TrendingRefresher
+
+	// MDBListClient is used by user-facing list discovery endpoints
+	// (search/top). May be nil; the handlers report "not configured" in
+	// that case rather than failing.
+	MDBListClient *mdblist.Client
+
+	// ABSHandler is the Audiobookshelf-compatible HTTP handler. When non-nil
+	// it is mounted at the root router level (not under /api/v1/) so that ABS
+	// clients hitting /login, /api/*, /abs/api/*, and /abs/socket.io/* all
+	// resolve correctly. May be nil; no ABS routes are registered in that case.
+	ABSHandler absHandler
+}
+
+// absHandler is the narrow interface the router needs from the ABS handler.
+// Using an interface avoids a direct import of the abs sub-package from router.go.
+type absHandler interface {
+	Mount(r chi.Router)
+}
+
+// CurrentConfig returns the live config when hot reload is wired, falling
+// back to the startup snapshot otherwise.
+func (d *Dependencies) CurrentConfig() *config.Config {
+	if d.LiveConfig != nil {
+		if cfg := d.LiveConfig(); cfg != nil {
+			return cfg
+		}
+	}
+	return d.Config
+}
+
+// NewRouter creates a chi.Router with all middleware and routes mounted
+// under /api/v1/. ABS-compat routes (/abs/*, /login, /socket.io/*) are
+// mounted at the root level when deps.ABSHandler is non-nil.
+func NewRouter(deps Dependencies) chi.Router {
+	r := chi.NewRouter()
+
+	// Standard middleware.
+	r.Use(middleware.RequestID)
+
+	// Client IP resolution must run before request logging.
+	if deps.ClientIPResolver != nil {
+		r.Use(clientip.Middleware(deps.ClientIPResolver))
+	}
+
+	r.Use(apimw.RequestLogger(deps.NodeID))
+	r.Use(middleware.Recoverer)
+	r.Use(apimw.Metrics)
+
+	// Compress text-like responses (JSON, SVG, …); media content types are
+	// not in the middleware's allowlist and stream through untouched.
+	r.Use(middleware.Compress(5))
+
+	// Activity logging (before auth — captures all requests including failed auth).
+	if deps.ActivityLogWriter != nil {
+		r.Use(activitylog.NewMiddleware(deps.ActivityLogWriter, deps.NodeID))
+	}
+
+	// Build the readiness handler with optional S3 check.
+	var s3Checker handlers.S3HealthChecker
+	if deps.S3Public != nil {
+		s3Checker = deps.S3Public
+	} else if deps.S3Private != nil {
+		s3Checker = deps.S3Private
+	}
+
+	// PG pinger: use the pool if available.
+	var pgPinger handlers.PGPinger
+	if deps.DB != nil {
+		pgPinger = deps.DB
+	}
+
+	readyHandler := handlers.NewReadyHandler(pgPinger, s3Checker)
+
+	// Resolves whether a declared profile belongs to the user and is the
+	// household primary profile. Nil (no user store) disables the
+	// acting-admin profile policy, degrading admin routes to the plain
+	// role check.
+	var checkPrimaryProfile apimw.PrimaryProfileChecker
+	// lookupProfile resolves a profile for the given user, returning nil when it
+	// does not exist. Shared by the acting-admin primary check and the
+	// diagnostics profile-attribution validator so both read profile state
+	// (IsPrimary, IsChild) the same way.
+	var lookupProfile func(ctx context.Context, userID int, profileID string) (*userstore.Profile, error)
+	if deps.UserStoreProvider != nil {
+		userStores := deps.UserStoreProvider
+		lookupProfile = func(ctx context.Context, userID int, profileID string) (*userstore.Profile, error) {
+			store, err := userStores.ForUser(ctx, userID)
+			if err != nil {
+				return nil, err
+			}
+			return store.GetProfile(ctx, profileID)
+		}
+		checkPrimaryProfile = func(ctx context.Context, userID int, profileID string) (bool, bool, error) {
+			profile, err := lookupProfile(ctx, userID, profileID)
+			if err != nil {
+				return false, false, err
+			}
+			if profile == nil {
+				return false, false, nil
+			}
+			return profile.IsPrimary, true, nil
+		}
+	}
+
+	var permissionPDP apimw.PermissionDecider
+	if deps.PolicySystem != nil {
+		permissionPDP = deps.PolicySystem.PDP()
+	}
+
+	// Admin authorization for routes: admin role, exercised through the
+	// account's primary household profile.
+	var requireActingAdmin func(http.Handler) http.Handler
+	if deps.PolicySystem != nil {
+		requireActingAdmin = apimw.NewPolicyActingAdminMiddleware(permissionPDP, checkPrimaryProfile)
+	} else {
+		// Legacy gate: proxy/test wiring without a policy system. Production integrated/api modes always take the policy path. Removed with the legacy cleanup phase.
+		requireActingAdmin = apimw.RequireActingAdmin(checkPrimaryProfile)
+	}
+
+	// Health handler advertises the server's identity so multi-server
+	// clients can display a friendly name. Falls back to empty strings
+	// if config is absent (tests, minimal fixtures); JSON omits empties.
+	var healthServerName, healthServerID string
+	if deps.Config != nil {
+		healthServerName = deps.Config.JellyfinCompat.ServerName
+		healthServerID = deps.Config.JellyfinCompat.ServerID
+	}
+	healthHandler := handlers.NewHealthHandler(healthServerName, healthServerID)
+
+	// Build server settings repo if DB is available (needed by auth and admin).
+	// Wrap it in the encrypting decorator so sensitive keys rest as ciphertext
+	// and every consumer transparently reads plaintext.
+	var settingsRepo catalog.SettingsStore
+	if deps.DB != nil {
+		settingsRepo = catalog.NewEncryptedSettingsRepo(catalog.NewServerSettingsRepo(deps.DB), deps.SecretCipher)
+	}
+	var accessGroupStore *access.GroupStore
+	if deps.DB != nil {
+		accessGroupStore = access.NewGroupStore(deps.DB)
+	}
+	var diagnosticsStore diagnostics.ObjectStore
+	if deps.S3Private != nil {
+		diagnosticsStore = diagnostics.NewS3ObjectStore(deps.S3Private)
+	}
+	var diagnosticsHandler *handlers.DiagnosticsHandler
+	if deps.DB != nil {
+		diagnosticsService := diagnostics.NewService(
+			diagnostics.NewPostgresRepository(deps.DB),
+			settingsRepo,
+			diagnosticsStore,
+			slog.Default(),
+		)
+		if lookupProfile != nil {
+			// Attribute reports only to a profile that belongs to the account and
+			// is not a child profile; child profiles must not perform diagnostics
+			// actions per the design, so reject their attribution here.
+			diagnosticsService.SetProfileAttributionValidator(diagnostics.NewProfileAttributionValidator(
+				func(ctx context.Context, userID int, profileID string) (bool, bool, error) {
+					profile, err := lookupProfile(ctx, userID, profileID)
+					if err != nil {
+						return false, false, err
+					}
+					if profile == nil {
+						return false, false, nil
+					}
+					return true, profile.IsChild, nil
+				},
+			))
+		}
+		diagnosticsHandler = handlers.NewDiagnosticsHandler(
+			diagnosticsService,
+		)
+	}
+
+	// Build auth handler and auth middleware if DB and config are available.
+	var userRepo *auth.UserRepository
+	var inviteCodeRepo *auth.InviteCodeRepository
+	var invitationService *invitations.Service
+	var apiKeyRepo *auth.APIKeyRepository
+	var authService *auth.Service
+	var authHandler *handlers.AuthHandler
+	var authMiddleware *apimw.AuthMiddleware
+	var viewerAccessMiddleware *apimw.ViewerAccessMiddleware
+	var metadataCurationAccess func(http.Handler) http.Handler
+	var markerEditAccess func(http.Handler) http.Handler
+	var viewerResolver apimw.ViewerResolver
+	var profileTokenService *access.ProfileTokenService
+	var jwtService *auth.JWTService
+	var sessionRepo *auth.SessionRepository
+	var deviceLoginService *auth.DeviceLoginService
+	if deps.DB != nil && deps.Config != nil {
+		userRepo = auth.NewUserRepository(deps.DB)
+		sessionRepo = auth.NewSessionRepository(deps.DB)
+		inviteCodeRepo = auth.NewInviteCodeRepository(deps.DB)
+		apiKeyRepo = auth.NewAPIKeyRepository(deps.DB)
+		jwtService = auth.NewJWTService(
+			deps.Config.Auth.JWTSecret,
+			deps.Config.Auth.AccessTokenExpiry,
+			deps.Config.Auth.RefreshTokenExpiry,
+		)
+		if deps.OnConfigChange != nil {
+			jwtForReload := jwtService
+			deps.OnConfigChange(func(_, updated *config.Config) {
+				jwtForReload.SetExpiries(updated.Auth.AccessTokenExpiry, updated.Auth.RefreshTokenExpiry)
+			})
+		}
+		provider := auth.NewLocalProvider(userRepo, sessionRepo)
+		authService = auth.NewService(
+			provider,
+			jwtService,
+			sessionRepo,
+			userRepo,
+			inviteCodeRepo,
+			settingsRepo,
+			deps.UserStoreProvider,
+		)
+		for _, registration := range deps.AuthProviders {
+			authService.RegisterProvider(registration.Info, registration.Provider)
+		}
+		if settingsRepo != nil {
+			invitationService = invitations.NewService(
+				invitations.NewRepository(deps.DB),
+				userRepo,
+				auth.NewAccountProvisioner(userRepo, deps.UserStoreProvider),
+				authService,
+				mail.NewSMTPSender(settingsRepo),
+				settingsRepo,
+				deps.PublicURL,
+			)
+		}
+		profileTokenService = access.NewProfileTokenService(deps.Config.Auth.JWTSecret, 0)
+		deviceLoginService = auth.NewDeviceLoginService(
+			deps.DB,
+			userRepo,
+			jwtService,
+			sessionRepo,
+			deps.UserStoreProvider,
+			profileTokenService,
+		)
+		authHandler = handlers.NewAuthHandler(authService, jwtService, deviceLoginService)
+		authMiddleware = apimw.NewAuthMiddleware(jwtService, sessionRepo, apiKeyRepo, userRepo)
+		if deps.UserStoreProvider != nil {
+			if deps.PolicySystem != nil {
+				viewerResolver = policy.NewViewerResolver(userRepo, deps.UserStoreProvider, profileTokenService, deps.PolicySystem.PDP(), accessGroupStore)
+			} else {
+				// Legacy resolver: proxy/test wiring without a policy system. Production integrated/api modes always take the policy path. Removed with the legacy cleanup phase.
+				viewerResolver = access.NewResolver(userRepo, deps.UserStoreProvider, profileTokenService, accessGroupStore)
+			}
+			viewerAccessMiddleware = apimw.NewViewerAccessMiddleware(viewerResolver)
+		}
+		if deps.DB != nil {
+			metadataLibraries := apimw.NewPGMetadataTargetLibraryResolver(deps.DB)
+			if deps.PolicySystem != nil {
+				metadataCurationAccess = apimw.NewPolicyPermissionMiddleware(
+					userRepo,
+					metadataLibraries,
+					checkPrimaryProfile,
+					permissionPDP,
+					accessGroupStore,
+				).RequireMetadataCurationForItem
+			} else {
+				// Legacy permission middleware: proxy/test wiring without a policy system. Production integrated/api modes always take the policy path. Removed with the legacy cleanup phase.
+				metadataCurationAccess = apimw.NewPermissionMiddleware(
+					userRepo,
+					metadataLibraries,
+					checkPrimaryProfile,
+				).RequireMetadataCurationForItem
+			}
+		}
+		if deps.PolicySystem != nil {
+			markerEditAccess = apimw.NewPolicyPermissionMiddleware(
+				userRepo,
+				nil, // marker gate does not resolve target libraries
+				checkPrimaryProfile,
+				permissionPDP,
+				accessGroupStore,
+			).RequireMarkerEdit
+		} else {
+			// Legacy gate: proxy/test wiring without a policy system. Production integrated/api modes always take the policy path. Removed with the legacy cleanup phase.
+			markerEditAccess = apimw.NewPermissionMiddleware(
+				userRepo,
+				nil,
+				checkPrimaryProfile,
+			).RequireMarkerEdit
+		}
+	}
+	if deps.SessionMgr != nil && userRepo != nil {
+		deps.SessionMgr.SetLimitProvider(func(ctx context.Context, userID int) (playback.SessionLimits, error) {
+			user, err := userRepo.GetByID(ctx, userID)
+			if err != nil {
+				return playback.SessionLimits{}, err
+			}
+			effective, err := access.EffectivePolicyForUser(ctx, user, accessGroupStore)
+			if err != nil {
+				return playback.SessionLimits{}, err
+			}
+			return playback.SessionLimits{
+				MaxStreams:               effective.MaxStreams,
+				MaxTranscodes:            effective.MaxTranscodes,
+				TranscodingDisabled:      !effective.TranscodeAllowed,
+				AudioTranscodingDisabled: !effective.AudioTranscodeAllowed,
+			}, nil
+		})
+		if deps.PolicySystem != nil {
+			deps.SessionMgr.SetAdmissionDecider(policy.NewPlaybackAdmissionDecider(deps.PolicySystem.PDP()))
+		}
+	}
+
+	// Build demo guard middleware if server settings are available.
+	var demoGuard *apimw.DemoGuard
+	if settingsRepo != nil {
+		demoGuard = apimw.NewDemoGuard(settingsRepo)
+	}
+
+	// Build library handler if folder repo is available.
+	var libraryHandler *handlers.LibraryHandler
+	if deps.FolderRepo != nil {
+		libraryHandler = handlers.NewLibraryHandler(deps.FolderRepo, deps.LibraryIngester, userRepo, deps.DB, deps.Refresher, deps.AppContext)
+		libraryHandler.EventBus = deps.EventBus
+		libraryHandler.EventsHub = deps.EventsHub
+		libraryHandler.ScanRegistry = deps.ScanRegistry
+		libraryHandler.ScanQueue = deps.LibraryScanQueue
+		libraryHandler.MovieMatchQueueRepo = deps.MovieMatchQueueRepo
+		libraryHandler.SeriesMatchQueueRepo = deps.SeriesRootMatchQueueRepo
+		libraryHandler.RawMatchBacklogRepo = deps.FileRepo
+		if deps.Config != nil {
+			libraryHandler.TVSeriesRootQueue = deps.Config.Matcher.TVSeriesRootQueueEnabled()
+		}
+		if deps.DB != nil {
+			libraryHandler.JobRepo = adminjob.NewRepository(deps.DB)
+		}
+
+		// Library poster uploads are writable client-facing assets, so they
+		// belong in the public assets bucket.
+		if deps.S3Public != nil {
+			libraryHandler.S3Meta = deps.S3Public
+		}
+
+		// Wire provider chain repos for per-library provider priority management.
+		if deps.DB != nil && deps.PluginService != nil {
+			libraryHandler.ChainRepo = metadata.NewChainRepository(deps.DB)
+			libraryHandler.PluginInstallations = plugins.NewInstallationStore(deps.DB)
+		}
+		if invalidator, ok := deps.MetadataService.(interface{ InvalidateChainCache() }); ok {
+			libraryHandler.SetChainCacheInvalidator(invalidator)
+		}
+		if deps.SkippedRootRepo != nil {
+			libraryHandler.SkippedRootRepo = deps.SkippedRootRepo
+		}
+		if deps.StaleIDRepo != nil {
+			libraryHandler.StaleIDRepo = deps.StaleIDRepo
+		}
+		if deps.DB != nil {
+			libraryHandler.SectionRepo = sections.NewRepository(deps.DB)
+		}
+		if deps.UserStoreProvider != nil {
+			libraryHandler.StoreProvider = deps.UserStoreProvider
+		}
+	}
+
+	// Build ratings repo if DB is available. Use dep-injected repo when provided
+	// (e.g. already constructed in main.go for the recommendations engine).
+	var ratingsRepo *catalog.RatingsRepo
+	if deps.RatingsRepo != nil {
+		ratingsRepo = deps.RatingsRepo
+	} else if deps.DB != nil {
+		ratingsRepo = catalog.NewRatingsRepo(deps.DB)
+	}
+
+	// Build browse/search/items handlers if DB is available.
+	var itemsHandler *handlers.ItemsHandler
+	var catalogResourceHandler *handlers.CatalogResourceHandler
+	var catalogHandler *handlers.CatalogHandler
+	var literaryWorkHandler *handlers.LiteraryWorkHandler
+	var peopleHandler *handlers.PeopleHandler
+	var itemRepo *catalog.ItemRepository
+	var episodeRepo *catalog.EpisodeRepository
+	var extraRepo *catalog.ExtraRepository
+	var providerIDRepo *catalog.ProviderIDRepository
+	var seasonRepo *catalog.SeasonRepository
+	var detailSvc *catalog.DetailService
+	var calendarRepo *catalog.CalendarRepository
+	var catalogSearchService *catalog.CatalogSearchService
+	var webhookSyncHandler *handlers.WebhookSyncHandler
+	var requestHandler *handlers.RequestsHandler
+	var onboardingHandler *handlers.OnboardingHandler
+	// Declared here (assigned in the playback block below) so the onboarding
+	// gates closure can reference it before that block runs.
+	var watchTogetherHandler *handlers.WatchTogetherHandler
+	var autoscanHandler *handlers.AutoscanHandler
+	var ebookReaderHandler *handlers.EbookReaderHandler
+	var ebookProgressStore *handlers.PGEbookReaderProgressStore
+	var ebookConfigStore *handlers.PGEbookReaderConfigStore
+	var ebookAnnotationStore *handlers.PGEbookReaderAnnotationStore
+	if deps.DB != nil {
+		ebookProgressStore = handlers.NewPGEbookReaderProgressStore(deps.DB)
+		ebookConfigStore = handlers.NewPGEbookReaderConfigStore(deps.DB)
+		ebookAnnotationStore = handlers.NewPGEbookReaderAnnotationStore(deps.DB)
+		browseRepo := catalog.NewBrowseRepository(deps.DB)
+		itemRepo = catalog.NewItemRepository(deps.DB)
+		searchIndexEvents := catalog.NewSearchIndexEventRepository(deps.DB)
+		catalogSearchService = catalog.NewCatalogSearchService(
+			context.Background(),
+			settingsRepo,
+			itemRepo,
+			searchIndexEvents,
+			deps.CatalogSearchVectorizer,
+		)
+		if catalogSearchService != nil {
+			catalogSearchService.StartCoverageRefresh(deps.AppContext)
+		}
+		activeSearchProvider := catalog.SearchProviderPostgres
+		if _, ok := catalogSearchService.Provider().(*catalog.MeilisearchSearchProvider); ok {
+			activeSearchProvider = catalog.SearchProviderMeilisearch
+		}
+		searchIndexEvents.WithActiveProvider(activeSearchProvider)
+		// Latch the provider for the package-level enqueue helpers used by
+		// metadata/scanner/etc. so they skip the per-call settings lookup.
+		catalog.SetActiveSearchIndexProvider(activeSearchProvider)
+		itemRepo.WithSearchIndexEvents(searchIndexEvents)
+		episodeRepo = catalog.NewEpisodeRepository(deps.DB)
+		extraRepo = catalog.NewExtraRepository(deps.DB)
+		providerIDRepo = catalog.NewProviderIDRepository(deps.DB)
+		calendarRepo = catalog.NewCalendarRepository(deps.DB)
+
+		var fileFetcher catalog.FileVersionFetcher
+		if deps.FileRepo != nil {
+			fileFetcher = deps.FileRepo
+		}
+
+		seasonRepo = catalog.NewSeasonRepository(deps.DB)
+		folderRepo := catalog.NewFolderRepository(deps.DB)
+
+		var episodeFileProvider handlers.EpisodeFileProvider
+		if deps.FileRepo != nil {
+			episodeFileProvider = deps.FileRepo
+		}
+
+		rootClaimRepo := catalog.NewRootClaimRepository(deps.DB)
+		groupClaimRepo := catalog.NewGroupClaimRepository(deps.DB)
+		literaryRepo := literaryworks.NewRepository(deps.DB)
+		literaryWorkHandler = &handlers.LiteraryWorkHandler{Service: literaryworks.NewService(literaryRepo)}
+		detailSvc = catalog.NewDetailService(itemRepo, episodeRepo, seasonRepo, deps.PersonRepo, fileFetcher)
+		detailSvc.SetFolderRepository(folderRepo)
+		detailSvc.SetRootClaimRepository(rootClaimRepo)
+		detailSvc.SetGroupClaimRepository(groupClaimRepo)
+		detailSvc.SetWorkSummaryProvider(literaryRepo)
+		detailSvc.SetProbeEnsurer(deps.ProbeEnsurer)
+		detailSvc.SetChapterThumbnailQueuer(deps.ChapterThumbnailQueuer)
+		if deps.ImageResolver != nil {
+			detailSvc.SetImageResolver(deps.ImageResolver)
+		}
+		detailSvc.SetUserStoreProvider(deps.UserStoreProvider)
+		itemsHandler = handlers.NewItemsHandler(
+			browseRepo,
+			itemRepo,
+			episodeRepo,
+			seasonRepo,
+			ratingsRepo,
+			episodeFileProvider,
+			deps.UserStoreProvider,
+			detailSvc,
+			providerIDRepo,
+		)
+		if catalogSearchService != nil {
+			itemsHandler.SetCatalogSearchProvider(catalogSearchService.Provider())
+		}
+		itemsHandler.EventsHub = deps.EventsHub
+		itemsHandler.UserRepo = userRepo
+		if requester, ok := deps.MetadataService.(handlers.MetadataRefreshRequester); ok {
+			itemsHandler.SetMetadataRefreshRequester(requester)
+		}
+		if dispatcher, ok := deps.WatchProviderService.(handlers.LocalWatchEventDispatcher); ok {
+			itemsHandler.SetLocalWatchEventDispatcher(dispatcher)
+		}
+		if deps.WatchCompletionObserver != nil {
+			itemsHandler.SetCompletionObserver(deps.WatchCompletionObserver)
+		}
+		if ebookProgressStore != nil {
+			itemsHandler.SetEbookReaderProgressStore(ebookProgressStore)
+		}
+		if deps.FileRepo != nil {
+			ebookReaderHandler = handlers.NewEbookReaderHandler(&handlers.MediaFileAuthorizer{
+				FileResolver:  deps.FileRepo,
+				ItemAccess:    itemRepo,
+				EpisodeLookup: episodeRepo,
+				ExtraLookup:   extraRepo,
+			})
+			if ebookProgressStore != nil {
+				ebookReaderHandler.ProgressStore = ebookProgressStore
+			}
+			if ebookConfigStore != nil {
+				ebookReaderHandler.ConfigStore = ebookConfigStore
+			}
+			if ebookAnnotationStore != nil {
+				ebookReaderHandler.AnnotationStore = ebookAnnotationStore
+			}
+			if conv := buildEbookConversion(deps, settingsRepo); conv != nil {
+				ebookReaderHandler.Conversion = conv
+			}
+		}
+		catalogResourceHandler = handlers.NewCatalogResourceHandler(itemsHandler)
+		catalogHandler = handlers.NewCatalogHandler(
+			catalog.NewCatalogResolver(browseRepo, itemRepo).
+				WithEpisodeRepository(episodeRepo).
+				WithUserStoreProvider(deps.UserStoreProvider).
+				WithSearchProvider(catalogSearchService.Provider()),
+			itemsHandler,
+		)
+		catalogHandler.SetWorkSummaryProvider(literaryRepo)
+
+		tmdbAPIKey := ""
+		if deps.Config != nil {
+			tmdbAPIKey = deps.Config.TMDBAPIKey
+		}
+		requestsRepo := mediarequests.NewRepository(deps.DB, deps.SecretCipher)
+		requestSvc := mediarequests.NewService(
+			requestsRepo,
+			tmdb.NewClient(tmdbAPIKey, 40),
+			mediarequests.NewCatalogPresence(itemRepo, providerIDRepo),
+		)
+		AttachRequestRouter(requestSvc, deps.PluginService)
+		requestSvc.SetGroupPolicyProvider(accessGroupStore)
+		requestSvc.SetRequesterIdentityResolver(plugins.RequesterIdentityFromLookup(plugins.NewPgUserIdentityLookup(deps.DB)))
+		if viewerResolver != nil {
+			requestSvc.SetEntitlementResolver(scopeEntitlementResolver{resolver: viewerResolver})
+		}
+		// Request lifecycle notifications (submitted / approved / declined):
+		// server-channel broadcasts plus personal deliveries to the requester
+		// on approve/decline. Fulfilled rides the reconcile service's
+		// fulfillment notifier instead.
+		if lifecycle := notifications.NewRequestLifecycleNotifier(deps.Notifications); lifecycle != nil {
+			requestSvc.SetLifecycleNotifier(lifecycle)
+		}
+		requestHandler = handlers.NewRequestsHandler(requestSvc)
+
+		// Onboarding tour manifest: gates consult live state at request time
+		// so admin toggles apply without a restart. The watch-together gate
+		// reads the handler variable assigned later in this function — by the
+		// time requests are served it is settled.
+		if deps.UserStoreProvider != nil {
+			onboardingGates := onboarding.Gates{
+				Requests: func(ctx context.Context) bool {
+					settings, err := requestsRepo.GetSettings(ctx)
+					return err == nil && settings.RequestsEnabled
+				},
+				WatchTogether: func(context.Context) bool {
+					return watchTogetherHandler != nil
+				},
+				Recommendations: func(ctx context.Context) bool {
+					if settingsRepo == nil {
+						return false
+					}
+					enabled, err := settingsRepo.Get(ctx, "recommendations.enabled")
+					return err == nil && enabled == "true"
+				},
+				Notifications: func(ctx context.Context) bool {
+					// The in-app inbox always exists; the step is about the
+					// wider system, so require a configured delivery channel.
+					return settingsRepo != nil && mail.NewSMTPSender(settingsRepo).Enabled(ctx)
+				},
+				JellyfinCompat: func(ctx context.Context) bool {
+					if settingsRepo == nil {
+						return false
+					}
+					// Unset means the default applies, and the default is on
+					// (config.DefaultAdminSettings) — only an explicit "false"
+					// hides the step.
+					enabled, err := settingsRepo.Get(ctx, "jellyfin_compat.enabled")
+					if err != nil {
+						return false
+					}
+					return strings.TrimSpace(enabled) != "false"
+				},
+			}
+			onboardingHandler = handlers.NewOnboardingHandler(deps.UserStoreProvider, onboardingGates)
+		}
+
+		autoscanRepo := autoscan.NewRepository(deps.DB, deps.SecretCipher)
+		if deps.FolderRepo != nil && deps.LibraryScanQueue != nil && deps.PluginService != nil {
+			autoscanSvc := BuildAutoscanService(
+				autoscanRepo,
+				deps.PluginService,
+				plugins.NewInstallationStore(deps.DB),
+				requestsRepo,
+				deps.FolderRepo,
+				deps.LibraryScanQueue,
+				deps.RedisClient,
+			)
+			autoscanHandler = handlers.NewAutoscanHandler(autoscanRepo, autoscanSvc)
+			// Wire the optional poll-task rescheduler so a settings change
+			// re-applies the poll interval without a restart.
+			if deps.TaskManager != nil {
+				autoscanHandler.SetTriggerUpdater(deps.TaskManager)
+			}
+			// Fully qualify webhook URLs when the public base URL is known.
+			autoscanHandler.SetPublicURL(deps.PublicURL)
+		}
+
+		if deps.PersonRepo != nil {
+			peopleHandler = handlers.NewPeopleHandler(deps.PersonRepo, browseRepo, itemRepo, detailSvc)
+			peopleHandler.SetItemsHandler(itemsHandler)
+			peopleHandler.SetRefreshQueue(deps.PersonRefreshQueue)
+			peopleHandler.SetRefreshService(deps.PersonRefresher)
+		}
+	}
+
+	// Build profile/personal data handlers if UserStoreProvider is available.
+	var profileHandler *handlers.ProfileHandler
+	var personalDataHandler *handlers.PersonalDataHandler
+	var progressHandler *handlers.ProgressHandler
+	var collectionHandler *handlers.CollectionHandler
+	var settingsHandler *handlers.SettingsHandler
+	var settingValuesHandler *handlers.SettingValuesHandler
+	var deviceHandler *handlers.DeviceHandler
+	var homeDismissalHandler *handlers.HomeDismissalHandler
+	var subtitlePrefHandler *handlers.SubtitlePrefHandler
+	var audioPrefHandler *handlers.AudioPrefHandler
+	var libraryPlaybackPrefHandler *handlers.LibraryPlaybackPrefHandler
+	var watchProviderHandler *handlers.WatchProviderHandler
+	var playbackSessionsLoader *handlers.PlaybackSessionsLoader
+	if deps.DB != nil {
+		playbackSessionsLoader = handlers.NewPlaybackSessionsLoader(deps.DB, deps.UserStoreProvider, detailSvc)
+	}
+
+	if deps.UserStoreProvider != nil {
+		profileHandler = handlers.NewProfileHandler(deps.UserStoreProvider)
+		profileHandler.UserRepo = userRepo
+		profileHandler.EventsHub = deps.EventsHub
+		profileHandler.ProfileTokens = profileTokenService
+		profileHandler.AvatarStore = deps.S3Private
+		profileHandler.SessionsReader = playbackSessionsLoader
+		personalDataHandler = handlers.NewPersonalDataHandler(deps.UserStoreProvider, itemRepo)
+		if detailSvc != nil {
+			personalDataHandler.SetDetailService(detailSvc)
+		}
+		if ebookProgressStore != nil {
+			personalDataHandler.SetEbookReaderProgressStore(ebookProgressStore)
+		}
+		personalDataHandler.SetEpisodeRepo(episodeRepo)
+		personalDataHandler.SetSeasonRepo(seasonRepo)
+		personalDataHandler.EventsHub = deps.EventsHub
+		if dispatcher, ok := deps.WatchProviderService.(handlers.LocalListEventDispatcher); ok {
+			personalDataHandler.SetLocalListEventDispatcher(dispatcher)
+		}
+		progressHandler = handlers.NewProgressHandler(deps.UserStoreProvider)
+		progressHandler.EventsHub = deps.EventsHub
+		if settingsRepo != nil {
+			progressHandler.SettingsRepo = settingsRepo
+		}
+		if deps.DB != nil {
+			progressHandler.LibraryLookup = catalog.NewLibraryItemRepository(deps.DB)
+		}
+		collectionHandler = handlers.NewCollectionHandler(deps.UserStoreProvider)
+		if deps.DB != nil {
+			collectionHandler.Executor = &catalog.QueryExecutor{Pool: deps.DB}
+		}
+		if deps.S3Public != nil {
+			collectionHandler.S3GP = deps.S3Public
+			collectionHandler.PresignTTL = 4 * time.Hour
+		}
+		settingsHandler = handlers.NewSettingsHandler(deps.UserStoreProvider)
+		settingsHandler.EventsHub = deps.EventsHub
+		if settingsRepo != nil {
+			settingsHandler.SetServerSettings(settingsRepo)
+		}
+		// The canonical settings API. main.go has already loaded and validated
+		// the contract by the time the router is built, so a failure here is
+		// unreachable — but the handler is simply omitted rather than panicking,
+		// which degrades to "no typed settings routes" instead of no server.
+		if contract, err := settingscontract.Load(); err == nil {
+			settingValuesHandler = handlers.NewSettingValuesHandler(deps.UserStoreProvider, contract)
+			settingValuesHandler.EventsHub = deps.EventsHub
+			// Household management: a primary profile acting for another
+			// profile on its own account. Without both of these the widening
+			// is unavailable rather than unguarded.
+			if userRepo != nil {
+				settingValuesHandler.UserRepo = userRepo
+			}
+			settingValuesHandler.ProfileTokens = profileTokenService
+			if deps.FolderRepo != nil {
+				settingValuesHandler.SetLibraryLookup(deps.FolderRepo)
+			} else if deps.DB != nil {
+				settingValuesHandler.SetLibraryLookup(catalog.NewFolderRepository(deps.DB))
+			}
+			if deps.DB != nil {
+				settingValuesHandler.SetLanguageSuggestionSource(catalog.NewBrowseRepository(deps.DB))
+			}
+		}
+		deviceHandler = handlers.NewDeviceHandler(deps.UserStoreProvider)
+		deviceHandler.EventsHub = deps.EventsHub
+		if userRepo != nil {
+			deviceHandler.UserRepo = userRepo
+		}
+		deviceHandler.ProfileTokens = profileTokenService
+		homeDismissalHandler = handlers.NewHomeDismissalHandler(deps.UserStoreProvider)
+		homeDismissalHandler.EventsHub = deps.EventsHub
+		subtitlePrefHandler = handlers.NewSubtitlePrefHandler(deps.UserStoreProvider)
+		subtitlePrefHandler.EventsHub = deps.EventsHub
+		audioPrefHandler = handlers.NewAudioPrefHandler(deps.UserStoreProvider)
+		audioPrefHandler.EventsHub = deps.EventsHub
+		libraryPlaybackPrefHandler = handlers.NewLibraryPlaybackPrefHandler(deps.UserStoreProvider)
+		libraryPlaybackPrefHandler.EventsHub = deps.EventsHub
+		if deps.FolderRepo != nil {
+			libraryPlaybackPrefHandler.SetLibraryLookup(deps.FolderRepo)
+		} else if deps.DB != nil {
+			libraryPlaybackPrefHandler.SetLibraryLookup(catalog.NewFolderRepository(deps.DB))
+		}
+	}
+	if deps.WatchProviderService != nil {
+		watchProviderHandler = handlers.NewWatchProviderHandler(deps.WatchProviderService)
+	}
+
+	// Build ratings handler if both repo and itemRepo are available.
+	var ratingsHandler *handlers.RatingsHandler
+	var recsRepoForStale *recommendations.Repo
+	if ratingsRepo != nil && itemRepo != nil {
+		ratingsHandler = handlers.NewRatingsHandler(ratingsRepo, itemRepo)
+		if deps.DB != nil {
+			recsRepoForStale = recommendations.NewRepo(deps.DB)
+			ratingsHandler.SetProfileStaler(recsRepoForStale)
+			ratingsHandler.SetProfileRefreshRequester(deps.RecWorker)
+			if personalDataHandler != nil {
+				personalDataHandler.SetProfileStaler(recsRepoForStale)
+				personalDataHandler.SetProfileRefreshRequester(deps.RecWorker)
+			}
+			if progressHandler != nil {
+				progressHandler.SetProfileStaler(recsRepoForStale)
+				progressHandler.SetProfileRefreshRequester(deps.RecWorker)
+			}
+			if itemsHandler != nil {
+				itemsHandler.SetProfileStaler(recsRepoForStale)
+				itemsHandler.SetProfileRefreshRequester(deps.RecWorker)
+			}
+		}
+	}
+
+	// Create subtitleRepo early — only needs DB, shared with playback handler and subtitle search handler.
+	var subtitleRepo *subtitles.PgRepository
+	if deps.DB != nil {
+		subtitleRepo = subtitles.NewPgRepository(deps.DB, deps.SecretCipher)
+	}
+
+	// Notifier that pushes "subtitle ready" events to active sessions when an AI
+	// translation completes. Assigned inside the playback handler block where the
+	// realtime hub and session manager are in scope; nil when playback is off.
+	var subtitleAINotifier *playback.SubtitleReadyNotifier
+
+	// Build playback handler if session manager is available.
+	var playbackHandler *handlers.PlaybackHandler
+	var adminPlaybackControlHandler *handlers.AdminPlaybackControlHandler
+	var playbackCommandDispatcher *playback.CommandDispatcher
+	var streamHandler *handlers.StreamHandler
+	if deps.SessionMgr != nil {
+		var playbackAdminStore handlers.PlaybackAdminStore
+		if deps.DB != nil {
+			playbackAdminStore = handlers.NewPGPlaybackAdminStore(deps.DB, deps.EventsHub)
+		}
+		if deps.FileRepo != nil {
+			playbackHandler = handlers.NewPlaybackHandler(deps.SessionMgr, deps.FileRepo)
+			streamHandler = handlers.NewStreamHandler(deps.SessionMgr, deps.FileRepo)
+		} else {
+			playbackHandler = handlers.NewPlaybackHandler(deps.SessionMgr)
+		}
+		if deps.DB != nil {
+			playbackHandler.PlanStoreV3 = planstore.NewPostgres(deps.DB)
+		}
+		// Maintenance also bounds the in-memory fallback store: without it a
+		// DB-less deployment accumulates attempts and replans forever.
+		playbackHandler.StartV3Maintenance(deps.AppContext)
+
+		// Wire UserStoreProvider for progress/history persistence.
+		if deps.UserStoreProvider != nil {
+			playbackHandler.StoreProvider = deps.UserStoreProvider
+		}
+		playbackHandler.StableIdentityResolver = watchstate.NewStableIdentityResolver(itemRepo, episodeRepo, providerIDRepo)
+		playbackHandler.CompletionObserver = deps.WatchCompletionObserver
+		if scrobbler, ok := deps.WatchProviderService.(handlers.PlaybackWatchScrobbler); ok {
+			playbackHandler.WatchScrobbler = scrobbler
+		}
+		playbackHandler.AdminStore = playbackAdminStore
+		playbackHandler.EventsHub = deps.EventsHub
+		if deps.FileRepo != nil {
+			playbackHandler.MissingMarker = deps.FileRepo
+		}
+		if deps.SessionSyncer != nil {
+			playbackHandler.SessionSyncer = deps.SessionSyncer
+		}
+		if streamHandler != nil {
+			// Share the playback handler's transcode/reconstruct manager so a
+			// direct/remux stream can rebuild its session from the token recipe
+			// after a restart (same manager, same SessionManager).
+			streamHandler.TM = playbackHandler.TranscodeManager()
+			if deps.Config != nil {
+				streamHandler.JWTSecret = deps.Config.Auth.JWTSecret
+			}
+			streamHandler.AdminStore = playbackAdminStore
+			streamHandler.EventsHub = deps.EventsHub
+			streamHandler.SessionSyncer = deps.SessionSyncer
+			if deps.FileRepo != nil {
+				streamHandler.MissingMarker = deps.FileRepo
+			}
+		}
+
+		// Wire the optional node planner and JWT secret for node-aware stream URLs.
+		if deps.NodePlanner != nil {
+			playbackHandler.NodePlanner = deps.NodePlanner
+		}
+		if deps.Config != nil && deps.Config.Auth.JWTSecret != "" {
+			playbackHandler.JWTSecret = deps.Config.Auth.JWTSecret
+		}
+		if deps.Config != nil {
+			playbackHandler.PlaybackConfig = func() config.PlaybackConfig {
+				return deps.CurrentConfig().Playback
+			}
+			// In integrated mode this and the jellycompat sweep both scan the same
+			// TranscodeDir but each snapshots only its own manager's live set, so a
+			// >24h idle dir owned by the other manager can be reaped. Bounded and
+			// safe: active dirs stay mtime-fresh (spared) and either side rebuilds
+			// from its token/recipe, so the worst case is a wasted rebuild. A shared
+			// active-set source across both managers would remove even that.
+			playback.StartPeriodicOrphanCleanup(deps.AppContext, "api", deps.Config.Playback.TranscodeDir, playbackHandler.CleanupOrphanedTranscodes, playback.OrphanCleanupInterval)
+		}
+		playbackHandler.ProbeEnsurer = deps.ProbeEnsurer
+		playbackHandler.ChapterThumbnailQueuer = deps.ChapterThumbnailQueuer
+		if settingsRepo != nil {
+			playbackHandler.SettingsRepo = settingsRepo
+		}
+		if deps.FileRepo != nil {
+			playbackHandler.FileVersionFetcher = deps.FileRepo
+		}
+		if subtitleRepo != nil {
+			playbackHandler.SubtitleRepo = subtitleRepo
+		}
+		if recsRepoForStale != nil {
+			playbackHandler.SetProfileStaler(recsRepoForStale)
+			playbackHandler.SetProfileRefreshRequester(deps.RecWorker)
+		}
+
+		realtimeHub := deps.PlaybackRealtimeHub
+		if realtimeHub == nil {
+			realtimeHub = playback.NewRealtimeHub()
+		}
+		commandTracker := playback.NewCommandTracker()
+		playbackHandler.RealtimeHub = realtimeHub
+		playbackHandler.CommandTracker = commandTracker
+		playbackHandler.CommandDispatcher = playback.NewCommandDispatcher(deps.SessionMgr, realtimeHub, commandTracker)
+		playbackCommandDispatcher = playbackHandler.CommandDispatcher
+		playbackHandler.IntroAnalyzer = deps.IntroAnalyzer
+		playbackHandler.IntroRepository = deps.IntroRepository
+		playbackHandler.MarkerRegistry = deps.MarkerRegistry
+		playbackHandler.MarkerResolver = deps.MarkerResolver
+		if deps.FileRepo != nil {
+			playbackHandler.MarkerUpserter = deps.FileRepo
+		}
+		playbackHandler.MarkerUpdateNotifier = playback.NewMarkerUpdateNotifier(deps.SessionMgr, realtimeHub)
+		// A resolver lets subtitle realtime events carry the combined ordinal
+		// the new track will hold in the next plan. Without a file repository
+		// the notifier still fires; its events just omit the track block.
+		var subtitleInventoryResolver playback.SubtitleInventoryResolver
+		if deps.FileRepo != nil {
+			// subtitleRepo is a concrete pointer: pass it only when non-nil so
+			// the resolver holds a nil interface rather than a typed nil.
+			var subtitleReader subtitles.Repository
+			if subtitleRepo != nil {
+				subtitleReader = subtitleRepo
+			}
+			if resolver := handlers.NewSubtitleInventoryResolver(deps.FileRepo, subtitleReader); resolver != nil {
+				subtitleInventoryResolver = resolver
+			}
+		}
+		subtitleAINotifier = playback.NewSubtitleReadyNotifier(deps.SessionMgr, realtimeHub, subtitleInventoryResolver)
+		adminPlaybackControlHandler = handlers.NewAdminPlaybackControlHandler(playbackHandler)
+
+		if deps.DB != nil && deps.FileRepo != nil && viewerResolver != nil && deps.Config != nil && detailSvc != nil {
+			roomTokenService := watchtogether.NewRoomTokenService(deps.Config.Auth.JWTSecret, 24*time.Hour)
+			watchTogetherHandler = handlers.NewWatchTogetherHandler(
+				watchtogether.NewService(
+					watchtogether.NewRepository(deps.DB),
+					deps.SessionMgr,
+					deps.FileRepo,
+					watchtogether.NewCatalogSelectionResolver(detailSvc),
+					watchtogether.NewSuggestionRepository(deps.DB),
+					watchtogether.NewProfileNameResolver(deps.UserStoreProvider),
+				),
+				viewerResolver,
+				roomTokenService,
+			)
+		}
+	}
+
+	// Wire subtitle repo and S3 client onto streamHandler for S3-stored subtitle serving.
+	if streamHandler != nil && subtitleRepo != nil && deps.S3Public != nil {
+		streamHandler.SubtitleRepo = subtitleRepo
+		streamHandler.S3Client = deps.S3Public
+		streamHandler.S3Bucket = deps.S3Public.Bucket()
+	}
+	if streamHandler != nil && deps.Config != nil {
+		streamHandler.PlaybackConfig = func() config.PlaybackConfig {
+			return deps.CurrentConfig().Playback
+		}
+		streamHandler.SubtitleCache = playback.NewSubtitleCache(func() string {
+			return deps.CurrentConfig().Playback.TranscodeDir
+		})
+	}
+
+	restartStatus := deps.ServerRestartStatus
+	if restartStatus == nil {
+		restartStatus = handlers.NewServerRestartStatusTracker()
+	}
+	serverControlHandler := handlers.NewServerControlHandler(deps.RequestServerRestart, playbackCommandDispatcher, restartStatus)
+
+	// Build admin handler if we have a user repo.
+	var adminHandler *handlers.AdminHandler
+	var accessGroupHandler *handlers.AccessGroupHandler
+	var catalogSeedHandler *handlers.CatalogSeedHandler
+	var adminJobsHandler *handlers.AdminJobsHandler
+	if userRepo != nil {
+		adminHandler = handlers.NewAdminHandler(userRepo, deps.DB, deps.UserStoreProvider)
+		adminHandler.SessionsLoader = playbackSessionsLoader
+		adminHandler.DetailSvc = detailSvc
+		adminHandler.EventBus = deps.EventBus
+		adminHandler.EventsHub = deps.EventsHub
+		adminHandler.ImpersonationService = authService
+		adminHandler.StatsSource = deps.AdminStatsProvider
+		adminHandler.RealtimeHub = deps.RealtimeHub
+		adminHandler.AccessGroups = accessGroupStore
+		adminHandler.BootstrapSensitiveConfigured = deps.BootstrapSensitiveConfigured
+		adminHandler.BootstrapSensitiveValues = deps.BootstrapSensitiveValues
+		adminHandler.RedisBootstrapAvailable = deps.RedisBootstrapAvailable
+		adminHandler.RestartStatus = restartStatus
+		adminHandler.CatalogSearchStatus = catalogSearchService
+		adminHandler.DiagnosticsStore = diagnosticsStore
+		if settingsRepo != nil {
+			adminHandler.SettingsRepo = settingsRepo
+		}
+		adminHandler.Config = deps.Config
+		if deps.OnUserSessionsRevoked != nil {
+			adminHandler.OnUserSessionsRevoked = deps.OnUserSessionsRevoked
+		}
+		if deps.OnServerSettingUpdated != nil {
+			adminHandler.OnServerSettingUpdated = deps.OnServerSettingUpdated
+		}
+	}
+	if accessGroupStore != nil {
+		accessGroupHandler = handlers.NewAccessGroupHandler(accessGroupStore)
+	}
+	if deps.DB != nil {
+		jobRepo := adminjob.NewRepository(deps.DB)
+		// Avoid wrapping a nil *s3client.Client in a non-nil interface;
+		// handlers rely on interface-nil checks to gate S3 features.
+		var privateStore handlers.CatalogSeedArtifactStore
+		if deps.S3Private != nil {
+			privateStore = deps.S3Private
+		}
+		catalogSeedHandler = handlers.NewCatalogSeedHandler(catalogseed.NewService(deps.DB, deps.PersonRepo, recommendations.NewRepo(deps.DB)), jobRepo, privateStore)
+		catalogSeedHandler.RealtimeHub = deps.RealtimeHub
+		adminJobsHandler = handlers.NewAdminJobsHandler(jobRepo, privateStore)
+		adminJobsHandler.CancelRegistry = deps.AdminJobCancelRegistry
+		adminJobsHandler.RealtimeHub = deps.RealtimeHub
+		if adminHandler != nil && deps.FolderRepo != nil && deps.FileRepo != nil && itemRepo != nil && episodeRepo != nil {
+			adminHandler.JobRepo = jobRepo
+			adminHandler.ItemRefreshResolver = adminjob.NewItemRefreshResolver(
+				itemRepo,
+				catalog.NewSeasonRepository(deps.DB),
+				episodeRepo,
+				deps.FolderRepo,
+				deps.FileRepo,
+			)
+		}
+	}
+
+	// Build admin match handler if metadata service and item repo are available.
+	var adminMatchHandler *handlers.AdminMatchHandler
+	if deps.MetadataService != nil && itemRepo != nil && deps.DB != nil {
+		adminMatchHandler = handlers.NewAdminMatchHandler(
+			itemRepo,
+			&handlers.PoolFolderLookup{Pool: deps.DB},
+			deps.MetadataService,
+		)
+	}
+
+	// Build admin split/merge handler for repairing wrong version groupings.
+	var adminSplitHandler *handlers.AdminSplitHandler
+	if itemRepo != nil && deps.DB != nil {
+		var merger handlers.ItemMerger
+		if m, ok := deps.MetadataService.(handlers.ItemMerger); ok {
+			merger = m
+		}
+		adminSplitHandler = handlers.NewAdminSplitHandler(
+			deps.DB,
+			itemRepo,
+			deps.MetadataService,
+			merger,
+			deps.Refresher,
+			deps.Scanner,
+			deps.FolderRepo,
+		)
+	}
+
+	// Build admin image handler for poster/backdrop/logo selection.
+	var adminImageHandler *handlers.AdminImageHandler
+	if imageSvc, ok := deps.MetadataService.(handlers.ImageService); ok && itemRepo != nil && seasonRepo != nil && episodeRepo != nil && deps.DB != nil && detailSvc != nil {
+		adminImageHandler = handlers.NewAdminImageHandler(
+			itemRepo,
+			seasonRepo,
+			episodeRepo,
+			&handlers.PoolFolderLookup{Pool: deps.DB},
+			imageSvc,
+			deps.PluginImageResolver,
+			detailSvc,
+		)
+		adminImageHandler.EventsHub = deps.EventsHub
+	}
+
+	var adminIntroHandler *handlers.AdminIntroHandler
+	if deps.IntroAnalyzer != nil && deps.IntroRepository != nil {
+		adminIntroHandler = handlers.NewAdminIntroHandler(
+			deps.IntroAnalyzer,
+			deps.IntroRepository,
+			deps.AppContext,
+			slog.Default(),
+		)
+		adminIntroHandler.Settings = settingsRepo
+		adminIntroHandler.FileResolver = deps.FileRepo
+		if playbackHandler != nil {
+			adminIntroHandler.MarkerUpdateNotifier = playbackHandler.MarkerUpdateNotifier
+		}
+	}
+
+	var markersHandler *handlers.MarkersHandler
+	if deps.FileRepo != nil {
+		var notifier handlers.PlaybackMarkerUpdateNotifier
+		if playbackHandler != nil {
+			notifier = playbackHandler.MarkerUpdateNotifier
+		}
+		var contributor handlers.MarkerContributor
+		if deps.MarkerContributionService != nil {
+			contributor = deps.MarkerContributionService
+		}
+		var contributions handlers.MarkerContributionLister
+		if deps.MarkerContributionStore != nil {
+			contributions = deps.MarkerContributionStore
+		}
+		markersHandler = handlers.NewMarkersHandler(
+			deps.FileRepo, deps.FileRepo, contributor, contributions, notifier, slog.Default(),
+		)
+		markersHandler.BaseContext = deps.AppContext
+		markersHandler.AuditHistory = deps.FileRepo
+		if itemRepo != nil {
+			markersHandler.Authorizer = &handlers.MediaFileAuthorizer{
+				FileResolver:  deps.FileRepo,
+				ItemAccess:    itemRepo,
+				EpisodeLookup: episodeRepo,
+				ExtraLookup:   extraRepo,
+			}
+		}
+	}
+
+	var adminMarkerProvidersHandler *handlers.AdminMarkerProvidersHandler
+	if deps.MarkerRegistry != nil && deps.MarkerProviderConfig != nil {
+		adminMarkerProvidersHandler = handlers.NewAdminMarkerProvidersHandler(
+			deps.MarkerRegistry, deps.MarkerProviderConfig, deps.EventBus, slog.Default(),
+		)
+	}
+
+	// Admin subtitle config handler only needs the DB repo — no S3 required.
+	var adminSubtitleHandler *handlers.AdminSubtitleHandler
+	var subtitleManager *subtitles.Manager
+	if subtitleRepo != nil {
+		adminSubtitleHandler = handlers.NewAdminSubtitleHandler(subtitleRepo)
+	}
+
+	// Build subtitle search handler if we have DB and S3.
+	var subtitleSearchHandler *handlers.SubtitleSearchHandler
+	if deps.DB != nil && deps.S3Public != nil && subtitleRepo != nil {
+		subtitleManager = subtitles.NewManager(subtitleRepo, deps.S3Public, deps.S3Public.Bucket())
+
+		// Load provider configs from DB and register enabled providers.
+		providerConfigs, _ := subtitleRepo.ListProviderConfigs(deps.AppContext)
+		for _, cfg := range providerConfigs {
+			if !cfg.Enabled {
+				continue
+			}
+			switch cfg.ProviderName {
+			case "opensubtitles":
+				if cfg.Username == "" || cfg.Password == "" {
+					continue
+				}
+				subtitleManager.RegisterProvider(opensubtitles.New(opensubtitles.Config{
+					Username: cfg.Username,
+					Password: cfg.Password,
+				}))
+			case "subdl":
+				if cfg.APIKey == "" {
+					continue
+				}
+				subtitleManager.RegisterProvider(subdl.New(subdl.Config{APIKey: cfg.APIKey}))
+			case "subsource":
+				if cfg.APIKey == "" {
+					continue
+				}
+				subtitleManager.RegisterProvider(subsource.New(subsource.Config{APIKey: cfg.APIKey}))
+			}
+		}
+
+		mediaResolver := &pgSubtitleMediaResolver{pool: deps.DB}
+		subtitleSearchHandler = handlers.NewSubtitleSearchHandler(subtitleManager, subtitleRepo, mediaResolver)
+	}
+
+	if adminSubtitleHandler != nil && deps.DB != nil && subtitleManager != nil {
+		adminSubtitleHandler.SetDownloadedSubtitleDeps(deps.DB, subtitleManager)
+	}
+
+	// Build the AI subtitle handler (on-demand translation). Generated tracks are
+	// stored as ordinary downloaded subtitles, so they reach every client through
+	// the existing subtitle pipeline with no client changes.
+	// Shared AI endpoint client + dispatch semaphore: subtitle translation/ASR
+	// and metadata translation draw from one client and one concurrency bound.
+	// Connection settings, models, toggles, and quotas hot-reload through
+	// OnConfigChange; only the semaphore size (ai.max_concurrent_jobs) is
+	// fixed at construction.
+	var aiClient *llm.Client
+	var aiSem chan struct{}
+	if deps.Config != nil {
+		aiClient = llm.NewClient(llmConfigFromServer(deps.Config))
+		aiSem = jobrunner.NewSemaphore(deps.Config.AI.MaxConcurrentJobs)
+		if deps.OnConfigChange != nil {
+			clientForReload := aiClient
+			deps.OnConfigChange(func(_, updated *config.Config) {
+				clientForReload.UpdateConfig(llmConfigFromServer(updated))
+			})
+		}
+	}
+
+	var subtitleAIHandler *handlers.SubtitleAIHandler
+	if subtitleManager != nil && subtitleRepo != nil && deps.FileRepo != nil && deps.DB != nil && deps.Config != nil {
+		aiCfg, disabledGateway := effectiveSubtitleAIConfig(deps.Config)
+		if disabledGateway != "" {
+			warnChatOnlyGateway(disabledGateway)
+		}
+		var aiNotifier subtitleai.Notifier
+		if subtitleAINotifier != nil {
+			aiNotifier = subtitleAINotifier
+		}
+		aiTranslator := subtitleai.NewLLMTranslator(aiClient, aiCfg.BatchSize, aiCfg.ContextNeighbors)
+		aiTranscriber := subtitleai.NewWhisperTranscriber(aiClient, deps.Config.Playback.FFmpegPath, deps.Config.SubtitleAI.ASRChunkSeconds)
+		aiService := subtitleai.NewService(
+			deps.AppContext,
+			aiCfg,
+			subtitleai.NewPgJobRepository(deps.DB),
+			aiTranslator,
+			aiTranscriber,
+			subtitleManager,
+			subtitleRepo,
+			deps.FileRepo,
+			aiNotifier,
+			deps.Config.Playback.FFmpegPath,
+			slog.Default(),
+			aiSem,
+		)
+		aiService.Recover()
+		if deps.OnConfigChange != nil {
+			deps.OnConfigChange(func(old, updated *config.Config) {
+				newCfg, newDisabled := effectiveSubtitleAIConfig(updated)
+				aiService.UpdateConfig(newCfg)
+				aiTranslator.SetBatching(updated.SubtitleAI.BatchSize, updated.SubtitleAI.ContextNeighbors)
+				aiTranscriber.SetExtraction(updated.Playback.FFmpegPath, updated.SubtitleAI.ASRChunkSeconds)
+				// Warn only when the gateway-disable condition newly appears,
+				// not on every unrelated settings change.
+				if newDisabled != "" && old != nil {
+					if _, oldDisabled := effectiveSubtitleAIConfig(old); oldDisabled == "" {
+						warnChatOnlyGateway(newDisabled)
+					}
+				}
+			})
+		}
+		subtitleAIHandler = handlers.NewSubtitleAIHandler(aiService)
+		subtitleAIHandler.StoreProvider = deps.UserStoreProvider
+	}
+
+	// Metadata AI translation (descriptions into the localization tables).
+	var metadataAIHandler *handlers.MetadataAIHandler
+	if deps.DB != nil && deps.Config != nil && aiClient != nil {
+		mtRepo := metadatatranslation.NewPgRepository(deps.DB)
+		mtService := metadatatranslation.NewService(
+			deps.AppContext,
+			metadataAIConfigFromServer(deps.Config),
+			mtRepo,
+			mtRepo,
+			&metadatatranslation.CatalogLocalizationStore{
+				Items:    catalog.NewMediaItemLocalizationRepository(deps.DB),
+				Seasons:  catalog.NewSeasonLocalizationRepository(deps.DB),
+				Episodes: catalog.NewEpisodeLocalizationRepository(deps.DB),
+			},
+			aiClient.SystemUserChat,
+			aiSem,
+			slog.Default(),
+		)
+		mtService.Recover()
+		if deps.OnConfigChange != nil {
+			deps.OnConfigChange(func(_, updated *config.Config) {
+				mtService.UpdateConfig(metadataAIConfigFromServer(updated))
+			})
+		}
+		metadataAIHandler = handlers.NewMetadataAIHandler(mtService)
+		// Wire the refresh fallback: libraries with auto_translate_metadata get
+		// missing localizations filled after each metadata refresh.
+		if mt, ok := deps.MetadataService.(interface {
+			SetAutoTranslator(metadata.AutoTranslator)
+		}); ok {
+			mt.SetAutoTranslator(mtService)
+		}
+	}
+
+	// Build section handler if DB is available.
+	var sectionHandler *handlers.SectionHandler
+	var sectionSettingsHandler *handlers.SectionSettingsHandler
+	var sectionBulkHandler *handlers.SectionBulkHandler
+	var libraryCollectionHandler *handlers.LibraryCollectionHandler
+	var libraryCollectionGroupHandler *handlers.LibraryCollectionGroupHandler
+	libraryCollectionService := deps.CollectionService
+	if deps.DB != nil {
+		sectionRepo := sections.NewRepository(deps.DB)
+		sectionBulkHandler = &handlers.SectionBulkHandler{Repo: sectionRepo}
+		sectionFetcher := sections.NewFetcher(deps.DB)
+		sectionFetcher.StoreProvider = deps.UserStoreProvider
+		sectionFetcher.CollectionRepo = catalog.NewLibraryCollectionRepository(deps.DB)
+		sectionFetcher.NextUpRepo = catalog.NewNextUpRepository(deps.DB, deps.UserStoreProvider)
+		sectionFetcher.AudiobookNextRepo = catalog.NewAudiobookNextRepository(deps.DB)
+		if deps.DB != nil {
+			sectionFetcher.RecommendationRepo = recommendations.NewRepo(deps.DB)
+			if ratingsRepo != nil {
+				sectionFetcher.RecommendationReader = recommendations.NewReader(sectionFetcher.RecommendationRepo, ratingsRepo, deps.RecWorker, deps.UserStoreProvider)
+			}
+		}
+		sections.InstallRecipeDelegate(sectionFetcher)
+		sectionHandler = handlers.NewSectionHandler(sectionRepo, sectionFetcher)
+		sectionHandler.CollectionRepo = sectionFetcher.CollectionRepo
+		sectionHandler.FolderRepo = deps.FolderRepo
+		if deps.UserStoreProvider != nil {
+			sectionHandler.StoreProvider = deps.UserStoreProvider
+		}
+		sectionHandler.EpisodeRepo = episodeRepo
+		sectionHandler.DetailSvc = detailSvc
+		if ebookProgressStore != nil {
+			sectionHandler.EbookProgress = ebookProgressStore
+		}
+		if userRepo != nil {
+			sectionHandler.UserRepo = userRepo
+		}
+		if settingsRepo != nil {
+			sectionHandler.Settings = settingsRepo
+			sectionSettingsHandler = &handlers.SectionSettingsHandler{Settings: settingsRepo}
+		}
+
+		libraryCollectionRepo := catalog.NewLibraryCollectionRepository(deps.DB)
+		if libraryCollectionService == nil {
+			libraryCollectionService = catalog.NewLibraryCollectionService(
+				libraryCollectionRepo,
+				itemRepo,
+				catalog.NewLibraryItemRepository(deps.DB),
+				nil,
+			)
+		}
+		if libraryCollectionService.TMDBCollections == nil {
+			apiKey := ""
+			if deps.Config != nil {
+				apiKey = deps.Config.TMDBAPIKey
+			}
+			libraryCollectionService.TMDBCollections = &tmdbCollectionAdapter{
+				client: tmdb.NewClient(apiKey, 40),
+			}
+		}
+		if libraryCollectionService.TMDBFranchises == nil {
+			apiKey := ""
+			if deps.Config != nil {
+				apiKey = deps.Config.TMDBAPIKey
+			}
+			libraryCollectionService.TMDBFranchises = &tmdbFranchiseAdapter{
+				client: tmdb.NewClient(apiKey, 40),
+			}
+		}
+		if libraryCollectionService.TMDBDiscovers == nil {
+			apiKey := ""
+			if deps.Config != nil {
+				apiKey = deps.Config.TMDBAPIKey
+			}
+			libraryCollectionService.TMDBDiscovers = &tmdbDiscoverAdapter{
+				client: tmdb.NewClient(apiKey, 40),
+			}
+		}
+		traktClientID := ""
+		if settingsRepo != nil {
+			ctx := deps.AppContext
+			if ctx == nil {
+				ctx = context.Background()
+			}
+			if value, err := settingsRepo.Get(ctx, "watchsync.trakt.client_id"); err == nil {
+				traktClientID = value
+			}
+		}
+		if libraryCollectionService.TraktCollections == nil {
+			libraryCollectionService.TraktCollections = &traktCollectionAdapter{
+				client: metatrakt.NewClient(traktClientID, 5),
+			}
+		}
+		if libraryCollectionService.TraktTokenResolver == nil && deps.DB != nil && settingsRepo != nil {
+			libraryCollectionService.TraktTokenResolver = &traktCollectionTokenResolver{
+				pool:     deps.DB,
+				settings: settingsRepo,
+				cipher:   deps.SecretCipher,
+				provider: watchtrakt.NewProvider(nil, ""),
+			}
+		}
+
+		// Propagate the now-wired Trakt + TMDB fetchers to the user-side sync
+		// service (constructed earlier in main.go before settingsRepo and the
+		// Trakt adapters existed, so its fetcher fields started nil).
+		if deps.UserCollectionSync != nil {
+			if deps.UserCollectionSync.TraktCollections == nil {
+				deps.UserCollectionSync.TraktCollections = libraryCollectionService.TraktCollections
+			}
+			if deps.UserCollectionSync.TraktTokenResolver == nil {
+				deps.UserCollectionSync.TraktTokenResolver = libraryCollectionService.TraktTokenResolver
+			}
+			if deps.UserCollectionSync.TMDBCollections == nil {
+				deps.UserCollectionSync.TMDBCollections = libraryCollectionService.TMDBCollections
+			}
+		}
+
+		// Propagate the now-wired Trakt fetcher to the trending refresher (built
+		// in main.go with TMDB only, before the Trakt adapter existed).
+		if deps.TrendingRefresher != nil && deps.TrendingRefresher.TraktTrending == nil {
+			deps.TrendingRefresher.TraktTrending = libraryCollectionService.TraktCollections
+		}
+
+		// Wire the trending snapshot reader into the section fetcher. The
+		// trending_discover home section reads its list from the persisted
+		// snapshot table; the upstream fetch happens out-of-band in the refresh
+		// task, so the read path never calls the provider.
+		sectionFetcher.TrendingSnapshots = sections.NewTrendingSnapshotRepository(deps.DB)
+
+		libraryCollectionHandler = handlers.NewLibraryCollectionHandler(
+			libraryCollectionRepo,
+			libraryCollectionService,
+			itemRepo,
+			4*time.Hour,
+			nil,
+			deps.S3Public,
+		)
+		libraryCollectionHandler.FrontendFS = deps.FrontendFS
+		libraryCollectionHandler.Executor = &catalog.QueryExecutor{Pool: deps.DB}
+		libraryCollectionHandler.SectionRepo = sectionRepo
+		libraryCollectionHandler.UserCollectionPool = deps.DB
+		libraryCollectionHandler.EventsHub = deps.EventsHub
+		if deps.FolderRepo != nil {
+			libraryCollectionHandler.FolderRepo = deps.FolderRepo
+		} else {
+			libraryCollectionHandler.FolderRepo = catalog.NewFolderRepository(deps.DB)
+		}
+		libraryCollectionGroupRepo := catalog.NewLibraryCollectionGroupRepository(deps.DB)
+		libraryCollectionHandler.GroupRepo = libraryCollectionGroupRepo
+		if deps.DB != nil {
+			libraryCollectionHandler.JobRepo = adminjob.NewRepository(deps.DB)
+		}
+		libraryCollectionGroupHandler = handlers.NewLibraryCollectionGroupHandler(
+			libraryCollectionGroupRepo,
+			libraryCollectionRepo,
+			deps.DB,
+		)
+		refresher := &catalog.SmartCountRefresher{
+			Pool:     deps.DB,
+			Executor: &catalog.QueryExecutor{Pool: deps.DB},
+		}
+		libraryCollectionHandler.SmartCountRefresher = refresher
+		appCtx := deps.AppContext
+		if appCtx == nil {
+			appCtx = context.Background()
+		}
+		go func() {
+			select {
+			case <-time.After(15 * time.Second):
+			case <-appCtx.Done():
+				return
+			}
+			refreshed, errs := refresher.RefreshAll(appCtx)
+			slog.Info("smart-count refresh complete", "refreshed", refreshed, "errors", errs)
+
+			ticker := time.NewTicker(time.Hour)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-appCtx.Done():
+					return
+				case <-ticker.C:
+					refreshed, errs := refresher.RefreshAll(appCtx)
+					slog.Debug("smart-count refresh complete", "refreshed", refreshed, "errors", errs)
+				}
+			}
+		}()
+		if detailSvc != nil {
+			libraryCollectionHandler.SetDetailService(detailSvc)
+			libraryCollectionHandler.SetupCollage()
+		}
+	}
+
+	// Build recommendations handler if ratings repo is available.
+	var recsHandler *handlers.RecommendationsHandler
+	if ratingsRepo != nil {
+		var recsRepo *recommendations.Repo
+		var recsReader *recommendations.Reader
+		if deps.DB != nil {
+			recsRepo = recommendations.NewRepo(deps.DB)
+			recsReader = recommendations.NewReader(recsRepo, ratingsRepo, deps.RecWorker, deps.UserStoreProvider)
+		}
+		recsHandler = handlers.NewRecommendationsHandler(deps.Recommender, recsReader, deps.UserStoreProvider, ratingsRepo, recsRepo, deps.Recommender != nil)
+		if deps.DB != nil {
+			recsFetcher := sections.NewFetcher(deps.DB)
+			recsFetcher.StoreProvider = deps.UserStoreProvider
+			recsFetcher.NextUpRepo = catalog.NewNextUpRepository(deps.DB, deps.UserStoreProvider)
+			recsFetcher.AudiobookNextRepo = catalog.NewAudiobookNextRepository(deps.DB)
+			recsHandler.Fetcher = recsFetcher
+			recsHandler.WatchTonightFetcher = recsFetcher
+		}
+		if detailSvc != nil {
+			recsHandler.DetailSvc = detailSvc
+		}
+		recsHandler.CalendarRepo = calendarRepo
+		recsHandler.EpisodeRepo = episodeRepo
+		if ebookProgressStore != nil {
+			recsHandler.EbookProgress = ebookProgressStore
+		}
+		if deps.PersonRepo != nil {
+			recsHandler.CastFetcher = deps.PersonRepo
+		}
+		if deps.RecWorker != nil {
+			recsHandler.RecWorker = deps.RecWorker
+		}
+	}
+
+	// Build download handler.
+	var downloadHandler *handlers.DownloadHandler
+	if deps.DB != nil && deps.FileRepo != nil && deps.Config != nil {
+		downloadRepo := downloads.NewRepository(deps.DB)
+		downloadBandwidth := downloads.NewBandwidthManager(
+			deps.Config.Download.ServerBandwidthBPS,
+			deps.Config.Download.UserBandwidthBPS,
+		)
+		downloadLimiter := downloads.NewQuantityLimiter(
+			downloadRepo,
+			deps.Config.Download.MaxConcurrentPerUser,
+			deps.Config.Download.MaxPerPeriod,
+			deps.Config.Download.PeriodDuration,
+		)
+		downloadSvc := downloads.NewService(
+			downloadRepo,
+			downloadBandwidth,
+			downloadLimiter,
+			deps.FileRepo,
+			itemRepo,
+			episodeRepo,
+			userRepo,
+			itemRepo,
+			settingsRepo,
+			&deps.Config.Download,
+		)
+		downloadSvc.SetGroupPolicyProvider(accessGroupStore)
+		if deps.PolicySystem != nil {
+			downloadSvc.SetActionDecider(deps.PolicySystem.PDP())
+		}
+		if detailSvc != nil {
+			// Offline manifest + artwork/subtitle proxies (Phase 2). subtitleManager
+			// may be nil when subtitles are unconfigured; pass a nil interface so the
+			// downloaded-subtitle path reports unavailable instead of panicking.
+			var subtitleSource downloads.SubtitleSource
+			if subtitleManager != nil {
+				subtitleSource = subtitleManager
+			}
+			downloadSvc.SetOfflineDeps(detailSvc, subtitleSource, nil)
+		}
+		if deps.ArtifactManager != nil {
+			// Prepare-to-file pipeline (Phase 3): remux/transcode-to-single-file.
+			downloadSvc.SetArtifactManager(deps.ArtifactManager)
+		}
+		// Series monitoring (auto-download subscriptions). Client-pull only:
+		// devices sync on app open / background refresh; there is no server
+		// background worker.
+		downloadSvc.SetSubscriptions(downloads.NewSubscriptionRepository(deps.DB))
+		downloadHandler = handlers.NewDownloadHandler(downloadSvc)
+		if profileHandler != nil {
+			// Profiles may live outside Postgres (sqlite userdb backend), so
+			// deleting one cannot FK-cascade the shared user_devices table;
+			// purge the device library (and its downloads) in-app instead.
+			profileHandler.DeviceLibraryPurger = downloadRepo
+		}
+	} else {
+		downloadHandler = handlers.NewDownloadHandler(nil)
+	}
+
+	var policyHandler *handlers.PolicyHandler
+	if deps.PolicySystem != nil && deps.DB != nil {
+		policyHandler = handlers.NewPolicyHandler(
+			deps.PolicySystem,
+			policy.NewPolicyStore(deps.DB),
+			policy.NewDecisionRepository(deps.DB),
+			func() bool {
+				cfg := deps.CurrentConfig()
+				return cfg != nil && cfg.Policy.EditorEnabled
+			},
+		)
+	}
+
+	var historyImportHandler *handlers.HistoryImportHandler
+	var historyImportSvc *historyimport.Service
+	if deps.DB != nil {
+		historyRepo := historyimport.NewRepository(deps.DB, deps.SecretCipher)
+		historyImportSvc = historyimport.NewService(deps.AppContext, historyRepo, deps.UserStoreProvider)
+		historyIdentity := watchstate.NewStableIdentityResolver(itemRepo, episodeRepo, providerIDRepo)
+		historyImportSvc.SetStableIdentityResolver(historyIdentity)
+		if deps.EventsHub != nil {
+			historyImportSvc.AddObserver(evt.NewHistoryImportObserver(deps.EventsHub))
+		}
+		historyImportHandler = handlers.NewHistoryImportHandler(historyImportSvc)
+		if deps.UserStoreProvider != nil {
+			webhookSyncSvc := webhooksync.NewService(webhooksync.NewRepository(deps.DB, deps.SecretCipher), historyRepo, deps.UserStoreProvider)
+			webhookSyncSvc.SetStableIdentityResolver(historyIdentity)
+			webhookSyncHandler = handlers.NewWebhookSyncHandler(webhookSyncSvc)
+		}
+	}
+
+	// ABS-compat routes are NOT mounted here — they live on a dedicated
+	// http.Server (see absCompatSrv in cmd/silo/main.go) so the discovery
+	// probes (/ping, /healthcheck, /status, etc.) don't collide with the
+	// SPA fallback. Same pattern as the Jellyfin compat listener on 8096.
+
+	r.Route("/api/v1", func(r chi.Router) {
+		r.Get("/health", healthHandler.ServeHTTP)
+		r.Get("/ready", readyHandler.ServeHTTP)
+
+		// Branding handler is shared between the public read/serve endpoints
+		// (registered with the theme endpoints below) and the admin
+		// upload/delete endpoints (registered in the admin group).
+		var brandingHandler *handlers.BrandingHandler
+		if deps.BrandingService != nil {
+			brandingHandler = handlers.NewBrandingHandler(deps.BrandingService)
+		}
+
+		if webhookSyncHandler != nil {
+			r.Post("/plex-sync/webhooks/{secret}", webhookSyncHandler.HandleWebhook)
+			r.Post("/webhook-sync/webhooks/{secret}", webhookSyncHandler.HandleWebhook)
+		}
+
+		// Theme endpoints (admin-css is public for pre-login branding).
+		if settingsRepo != nil {
+			themeHandler := handlers.NewThemeHandler(settingsRepo)
+			r.Get("/theme/admin-css", themeHandler.HandleAdminCSS)
+			if brandingHandler != nil {
+				// Public branding read + asset serving (pre-login white-label).
+				r.Get("/theme/branding", brandingHandler.HandleGetBranding)
+				r.Get("/branding/assets/{kind}", brandingHandler.HandleServeAsset)
+			}
+
+			// Catalog and download proxies require auth (to avoid open proxy).
+			if authMiddleware != nil {
+				r.Group(func(r chi.Router) {
+					r.Use(authMiddleware.RequireAuth)
+					r.Get("/theme/catalog", themeHandler.HandleCatalog)
+					r.Get("/theme/download", themeHandler.HandleDownload)
+					r.With(requireActingAdmin).Post("/theme/catalog/refresh", themeHandler.HandleCatalogRefresh)
+				})
+			}
+		}
+
+		if deps.PluginHTTPProxy != nil {
+			r.HandleFunc("/plugins/{installation_id}/*", func(w http.ResponseWriter, r *http.Request) {
+				installationID, err := strconv.Atoi(chi.URLParam(r, "installation_id"))
+				if err != nil {
+					http.Error(w, "invalid installation id", http.StatusBadRequest)
+					return
+				}
+				authenticated, admin, userID, profileID := resolveOptionalPluginAccessUser(r, jwtService, sessionRepo, apiKeyRepo, userRepo)
+				ctx := plugins.WithPluginAccessUser(r.Context(), authenticated, admin, userID, profileID)
+				deps.PluginHTTPProxy.ServeRoute(w, r.WithContext(ctx), installationID, authenticated, admin)
+			})
+			r.Get("/plugin-assets/{installation_id}/*", func(w http.ResponseWriter, r *http.Request) {
+				installationID, err := strconv.Atoi(chi.URLParam(r, "installation_id"))
+				if err != nil {
+					http.Error(w, "invalid installation id", http.StatusBadRequest)
+					return
+				}
+				assetPath := strings.TrimPrefix(chi.URLParam(r, "*"), "/")
+				if assetPath == "" {
+					http.NotFound(w, r)
+					return
+				}
+				authenticated, admin := resolveOptionalPluginAccess(r, jwtService, sessionRepo)
+				deps.PluginHTTPProxy.ServeAsset(w, r.WithContext(plugins.WithPluginAccess(r.Context(), authenticated, admin)), installationID, assetPath)
+			})
+		}
+
+		// Auth routes: public (no auth required).
+		if authHandler != nil {
+			// OAuth handler is optional: it only stands up when PublicURL is
+			// configured (we need a stable redirect_uri origin for IdPs) and
+			// the DB is available (oauth_session storage).
+			var oauthHandler *auth.OAuthHandler
+			if deps.PublicURL != "" && deps.DB != nil && authService != nil && jwtService != nil {
+				stateSecret := auth.DeriveOAuthStateSecret([]byte(deps.Config.Auth.JWTSecret))
+				oauthStore := auth.NewPGOAuthStore(deps.DB, stateSecret)
+				resolveClient := func(ctx context.Context, installationID int) (auth.OAuthClient, string, error) {
+					pp := authService.FindOAuthInstallation(installationID)
+					if pp == nil {
+						return nil, "", errors.New("plugin not found")
+					}
+					c, err := pp.OAuthClient(ctx)
+					if err != nil {
+						return nil, "", err
+					}
+					return c, pp.CapabilityID(), nil
+				}
+				oauthHandler = auth.NewOAuthHandler(auth.OAuthHandlerDeps{
+					Store:           oauthStore,
+					CompletionStore: oauthStore,
+					StateSecret:     stateSecret,
+					ResolveClient:   resolveClient,
+					LoginCompleter:  authService,
+					HostBaseURL:     deps.PublicURL,
+					StateTTL:        10 * time.Minute,
+				})
+			}
+			authHandler.SetOAuthRoutesAvailable(oauthHandler != nil)
+
+			if invitationService != nil {
+				invitationHandler := handlers.NewInvitationHandler(invitationService)
+				r.Route("/invitations/{token}", func(r chi.Router) {
+					if deps.RateLimitMW != nil {
+						r.With(deps.RateLimitMW.AuthEndpointHandler("invitation")).Get("/", invitationHandler.HandleLookupInvitation)
+						r.With(deps.RateLimitMW.AuthEndpointHandler("invitation")).Post("/accept", invitationHandler.HandleAcceptInvitation)
+					} else {
+						r.Get("/", invitationHandler.HandleLookupInvitation)
+						r.Post("/accept", invitationHandler.HandleAcceptInvitation)
+					}
+				})
+			}
+
+			r.Route("/auth", func(r chi.Router) {
+				r.Get("/device/capability", authHandler.HandleDeviceCapability)
+				if deps.RateLimitMW != nil {
+					r.With(deps.RateLimitMW.AuthEndpointHandler("login")).Post("/login", authHandler.HandleLogin)
+					r.With(deps.RateLimitMW.AuthEndpointHandler("setup")).Post("/setup", authHandler.HandleSetup)
+					r.With(deps.RateLimitMW.AuthEndpointHandler("signup")).Post("/signup", authHandler.HandleSignup)
+				} else {
+					r.Post("/login", authHandler.HandleLogin)
+					r.Post("/setup", authHandler.HandleSetup)
+					r.Post("/signup", authHandler.HandleSignup)
+				}
+				r.Get("/setup", authHandler.HandleSetupStatus)
+				r.Get("/providers", authHandler.HandleProviders)
+				r.Post("/refresh", authHandler.HandleRefresh)
+				r.Get("/signup", authHandler.HandleSignupStatus)
+				if authMiddleware != nil {
+					r.With(
+						authMiddleware.RequireAuth,
+						optionalProfileViewerAccess(viewerAccessMiddleware),
+					).Post("/plugin-launch", authHandler.HandlePluginLaunch)
+				}
+				if oauthHandler != nil {
+					r.Post("/oauth/complete", oauthHandler.HandleComplete)
+					r.Route("/oauth/{install_id}", func(r chi.Router) {
+						r.Post("/init", oauthHandler.HandleInit)
+						r.Get("/callback", oauthHandler.HandleCallback)
+					})
+				}
+				if deps.RateLimitMW != nil {
+					r.With(deps.RateLimitMW.AuthEndpointHandler("device_start")).Post("/device/start", authHandler.HandleDeviceStart)
+					r.With(deps.RateLimitMW.AuthEndpointHandler("device_lookup")).Get("/device", authHandler.HandleDeviceLookup)
+					r.With(deps.RateLimitMW.AuthEndpointHandler("device_poll")).Post("/device/poll", authHandler.HandleDevicePoll)
+				} else {
+					r.Post("/device/start", authHandler.HandleDeviceStart)
+					r.Get("/device", authHandler.HandleDeviceLookup)
+					r.Post("/device/poll", authHandler.HandleDevicePoll)
+				}
+
+				// Protected auth routes (require valid session).
+				if authMiddleware != nil {
+					r.Group(func(r chi.Router) {
+						r.Use(authMiddleware.RequireAuth)
+						r.Post("/logout", authHandler.HandleLogout)
+						r.Post("/impersonation/end", authHandler.HandleEndImpersonation)
+						r.Get("/me", authHandler.HandleMe)
+						r.Get("/sessions", authHandler.HandleListSessions)
+						r.Delete("/sessions/{id}", authHandler.HandleDeleteSession)
+						r.Post("/device/approve", authHandler.HandleDeviceApprove)
+						r.Post("/device/deny", authHandler.HandleDeviceDeny)
+					})
+					if viewerAccessMiddleware != nil {
+						r.With(
+							authMiddleware.RequireAuth,
+							viewerAccessMiddleware.RequireViewerAccess,
+						).Post("/device/approve-handoff", authHandler.HandleDeviceApproveHandoff)
+					}
+				}
+			})
+		}
+
+		// Autoscan webhook intake: public — Sonarr/Radarr POST here without a
+		// Silo session; the URL's bearer token authenticates the delivery and
+		// maps it to its Autoscan source. Rate limited per-IP (plus the
+		// "autoscan_webhook" per-endpoint limit) since it is unauthenticated.
+		if autoscanHandler != nil {
+			if deps.RateLimitMW != nil {
+				r.With(deps.RateLimitMW.AuthEndpointHandler("autoscan_webhook")).
+					Post("/autoscan/webhooks/{token}", autoscanHandler.HandleWebhookDelivery)
+			} else {
+				r.Post("/autoscan/webhooks/{token}", autoscanHandler.HandleWebhookDelivery)
+			}
+		}
+
+		// Discord account-link OAuth callback: public — Discord redirects the
+		// browser here without credentials; the one-time link-state row
+		// authenticates the request and maps it back to the initiating
+		// account. The static path coexists with the authenticated
+		// /notifications subrouter below (static routes win in chi).
+		var discordNotificationsHandler *handlers.DiscordNotificationsHandler
+		if deps.Notifications != nil {
+			discordNotificationsHandler = handlers.NewDiscordNotificationsHandler(deps.Notifications, deps.PublicURL)
+			r.Get("/notifications/discord/link/callback", discordNotificationsHandler.HandleLinkCallback)
+
+			// Tokenized email links: public — clicked from mail clients on
+			// devices without a Silo session; the single-use token (verify)
+			// or per-profile capability token (unsubscribe) authenticates the
+			// request. Static paths coexist with the authenticated
+			// /notifications subrouter below, same as the Discord callback.
+			deps.Notifications.SetPublicURL(deps.PublicURL)
+			emailLinkHandler := handlers.NewEmailLinkHandler(deps.Notifications)
+			r.Get("/notifications/email/verify", emailLinkHandler.HandleVerify)
+			r.Get("/notifications/email/unsubscribe", emailLinkHandler.HandleUnsubscribe)
+			r.Post("/notifications/email/unsubscribe", emailLinkHandler.HandleUnsubscribe)
+		}
+
+		// API key management routes (auth only, no viewer access needed).
+		if apiKeyRepo != nil && authMiddleware != nil {
+			r.Group(func(r chi.Router) {
+				r.Use(authMiddleware.RequireAuth)
+				if demoGuard != nil {
+					r.Use(demoGuard.Guard)
+				}
+
+				apiKeyHandler := handlers.NewAPIKeyHandler(apiKeyRepo)
+				r.Route("/api-keys", func(r chi.Router) {
+					r.Post("/", apiKeyHandler.HandleCreateAPIKey)
+					r.Get("/", apiKeyHandler.HandleListAPIKeys)
+					r.Delete("/{id}", apiKeyHandler.HandleDeleteAPIKey)
+				})
+			})
+		}
+
+		// Client diagnostics are account-scoped and must work before profile
+		// selection, so this route intentionally uses auth only plus the
+		// generic rate limiter, not viewer/profile middleware.
+		if diagnosticsHandler != nil && authMiddleware != nil {
+			r.Group(func(r chi.Router) {
+				r.Use(authMiddleware.RequireAuth)
+				// Demo mode blocks non-admin report uploads (a write to the
+				// private bucket and DB); the read-only status endpoint stays
+				// available because DemoGuard always lets GETs through.
+				if demoGuard != nil {
+					r.Use(demoGuard.Guard)
+				}
+				if deps.RateLimitMW != nil {
+					r.Use(deps.RateLimitMW.Handler)
+				}
+				r.Route("/diagnostics", func(r chi.Router) {
+					r.Get("/status", diagnosticsHandler.HandleStatus)
+					r.Post("/reports", diagnosticsHandler.HandleUpload)
+					// Chunked fallback for bundles a fronting proxy's
+					// request-body cap rejects as one request. Same
+					// ingest/validation path; see diagnostics_chunked.go.
+					r.Route("/reports/uploads", func(r chi.Router) {
+						r.Post("/", diagnosticsHandler.HandleChunkedUploadInit)
+						r.Put("/{upload_id}/chunks/{chunk_index}", diagnosticsHandler.HandleChunkedUploadChunk)
+						r.Post("/{upload_id}/complete", diagnosticsHandler.HandleChunkedUploadComplete)
+						r.Delete("/{upload_id}", diagnosticsHandler.HandleChunkedUploadAbort)
+					})
+				})
+			})
+		}
+
+		// Compatibility-listener connection details. Account-scoped like
+		// diagnostics above: the settings card that renders this describes how
+		// to sign in, so it must not depend on a profile already being chosen.
+		if authMiddleware != nil {
+			// userRepo is a concrete pointer, so it has to stay out of the
+			// interface parameter when unset — a typed nil would satisfy the
+			// handler's nil check and panic on first use.
+			var compatUsers handlers.UserRepository
+			if userRepo != nil {
+				compatUsers = userRepo
+			}
+			compatConnectInfoHandler := handlers.NewCompatConnectInfoHandler(
+				deps.Config,
+				settingsRepo,
+				compatUsers,
+			)
+			r.Group(func(r chi.Router) {
+				r.Use(authMiddleware.RequireAuth)
+				if deps.RateLimitMW != nil {
+					r.Use(deps.RateLimitMW.Handler)
+				}
+				r.Get("/compat/connect-info", compatConnectInfoHandler.HandleGetConnectInfo)
+			})
+		}
+
+		// All remaining routes require auth.
+		if authMiddleware != nil {
+			r.Group(func(r chi.Router) {
+				r.Use(authMiddleware.RequireAuth)
+				if demoGuard != nil {
+					r.Use(demoGuard.Guard)
+				}
+				if deps.RateLimitMW != nil {
+					r.Use(deps.RateLimitMW.Handler)
+				}
+				if viewerAccessMiddleware != nil {
+					r.Use(viewerAccessMiddleware.RequireViewerAccess)
+				}
+
+				// User-facing library route (all authenticated users).
+				if libraryHandler != nil {
+					r.Get("/user/libraries", libraryHandler.HandleListUserLibraries)
+				}
+				if deps.EventsHub != nil {
+					eventsHandler := handlers.NewEventsHandler(
+						deps.EventsHub,
+						adminJobsHandler,
+						adminHandler,
+						deps.TaskManager,
+						deps.ScanRegistry,
+						deps.LibraryScanQueue,
+						historyImportSvc,
+					)
+					eventsHandler.SetNotificationsSystem(deps.Notifications)
+					r.Get("/events/ws", eventsHandler.HandleWebSocket)
+					r.Get("/events/capability", eventsHandler.HandleCapability)
+				}
+
+				// User notifications: profile-scoped inbox, preferences, and
+				// the websocket handshake ticket.
+				if deps.Notifications != nil {
+					if detailSvc != nil {
+						deps.Notifications.SetImageResolver(detailSvc)
+					}
+					notificationsHandler := handlers.NewNotificationsHandler(deps.Notifications, deps.EventsHub)
+					r.With(apimw.RequireProfile).Post("/events/ws-ticket", notificationsHandler.HandleMintWSTicket)
+					r.With(apimw.RequireProfile).Post("/devices/push/apple", notificationsHandler.HandleRegisterApplePushDevice)
+					// Discord DM channel: the linked identity and mode hang off
+					// the login account, not a profile, so these stay outside
+					// the RequireProfile subrouter below (static paths coexist
+					// with it, same as the public email-link routes above).
+					if discordNotificationsHandler != nil {
+						r.Get("/notifications/discord-preferences", discordNotificationsHandler.HandleGetPreferences)
+						r.Put("/notifications/discord-preferences", discordNotificationsHandler.HandleUpdatePreferences)
+						r.Delete("/notifications/discord-link", discordNotificationsHandler.HandleUnlink)
+						r.Post("/notifications/discord/link/init", discordNotificationsHandler.HandleLinkInit)
+					}
+					r.Route("/notifications", func(r chi.Router) {
+						r.Use(apimw.RequireProfile)
+						r.Get("/", notificationsHandler.HandleList)
+						r.Get("/sync", notificationsHandler.HandleSync)
+						r.Get("/unread-count", notificationsHandler.HandleUnreadCount)
+						r.Get("/capability", notificationsHandler.HandleCapability)
+						r.Get("/preferences", notificationsHandler.HandleGetPreferences)
+						r.Put("/preferences", notificationsHandler.HandleUpdatePreferences)
+						r.Get("/push/apple/display/{delivery_id}", notificationsHandler.HandleApplePushDisplay)
+						// Platform-generic registration used by the Android
+						// client; Apple keeps its dedicated route above.
+						r.Post("/push/devices", notificationsHandler.HandleRegisterPushDevice)
+						r.Delete("/push/devices/{device_id}", notificationsHandler.HandleUnregisterPushDevice)
+						r.Get("/email-preferences", notificationsHandler.HandleGetEmailPreferences)
+						r.Put("/email-preferences", notificationsHandler.HandleUpdateEmailPreferences)
+						r.Put("/email-preferences/address", notificationsHandler.HandleRequestEmailAddress)
+						r.Delete("/email-preferences/address", notificationsHandler.HandleClearEmailAddress)
+						r.Post("/read-all", notificationsHandler.HandleReadAll)
+						r.Route("/webhooks", func(r chi.Router) {
+							r.Get("/", notificationsHandler.HandleListWebhooks)
+							r.Post("/", notificationsHandler.HandleCreateWebhook)
+							r.Put("/{id}", notificationsHandler.HandleUpdateWebhook)
+							r.Delete("/{id}", notificationsHandler.HandleDeleteWebhook)
+							r.Post("/{id}/rotate-secret", notificationsHandler.HandleRotateWebhookSecret)
+							r.Post("/{id}/test", notificationsHandler.HandleTestWebhook)
+						})
+						r.Route("/web-push", func(r chi.Router) {
+							r.Get("/subscriptions", notificationsHandler.HandleWebPushList)
+							r.Post("/subscriptions", notificationsHandler.HandleWebPushSubscribe)
+							r.Delete("/subscriptions/{id}", notificationsHandler.HandleWebPushDelete)
+							r.Post("/unsubscribe", notificationsHandler.HandleWebPushUnsubscribe)
+						})
+						r.Get("/{id}", notificationsHandler.HandleGet)
+						r.Post("/{id}/read", notificationsHandler.HandleMarkRead)
+					})
+				}
+
+				// Marker reads for any authenticated viewer; writes require the
+				// marker_edit permission, decided by the policy PDP. Users fix
+				// and create intro/recap/credits/preview markers from the
+				// player. Writes are stamped source="manual" and contributed to
+				// enabled providers in the background. Contribution + provider
+				// config stay admin-only (see the /admin group below).
+				if markersHandler != nil && markerEditAccess != nil {
+					r.Route("/markers", func(r chi.Router) {
+						r.Get("/items/{id}", markersHandler.HandleGetItemMarkers)
+						r.Get("/files/{fileId}", markersHandler.HandleGetFileMarkers)
+						r.Group(func(r chi.Router) {
+							r.Use(markerEditAccess)
+							r.Put("/items/{id}", markersHandler.HandleSetItemMarkers)
+							r.Put("/files/{fileId}", markersHandler.HandleSetFileMarkers)
+							r.Delete("/files/{fileId}/{segment}", markersHandler.HandleClearFileSegment)
+						})
+					})
+				}
+
+				// Library management routes (admin-only).
+				if libraryHandler != nil {
+					r.Group(func(r chi.Router) {
+						r.Use(requireActingAdmin)
+
+						r.Route("/libraries", func(r chi.Router) {
+							r.Get("/", libraryHandler.HandleListLibraries)
+							r.Get("/roots", libraryHandler.HandleListRoots)
+							r.Put("/roots/override", libraryHandler.HandleUpsertRootOverride)
+							r.Delete("/roots/override", libraryHandler.HandleDeleteRootOverride)
+							r.Get("/skipped-roots", libraryHandler.HandleListSkippedRoots)
+							r.Get("/stale-ids", libraryHandler.HandleListStaleIDs)
+							r.Post("/stale-ids/{contentID}/rematch", libraryHandler.HandleRematchStaleID)
+							r.Get("/unmatched-items", libraryHandler.HandleListUnmatchedItems)
+							r.Get("/metadata-match-queue", libraryHandler.HandleListMetadataMatchQueues)
+							r.Post("/", libraryHandler.HandleCreateLibrary)
+							r.Put("/reorder", libraryHandler.HandleReorderLibraries)
+							r.Put("/{id}", libraryHandler.HandleUpdateLibrary)
+							r.Delete("/{id}", libraryHandler.HandleDeleteLibrary)
+							r.Post("/{id}/check-mount", libraryHandler.HandleCheckLibraryMount)
+							r.Post("/{id}/confirm-empty-root-cleanup", libraryHandler.HandleConfirmEmptyRootCleanup)
+							r.Get("/{id}/metadata-match-queue", libraryHandler.HandleGetMetadataMatchQueue)
+							r.Post("/{id}/metadata-match-queue/retry", libraryHandler.HandleRetryMetadataMatchQueue)
+							r.Post("/{id}/metadata-match-queue/cancel", libraryHandler.HandleCancelMetadataMatchQueue)
+							r.Post("/{id}/refresh-metadata", libraryHandler.HandleRefreshLibraryMetadata)
+							r.Get("/provider-defaults", libraryHandler.HandleGetLibraryProviderDefaults)
+							r.Get("/{id}/providers", libraryHandler.HandleGetLibraryProviders)
+							r.Put("/{id}/providers", libraryHandler.HandleSetLibraryProviders)
+							r.Put("/{id}/poster", libraryHandler.HandleUploadPoster)
+							r.Delete("/{id}/poster", libraryHandler.HandleDeletePoster)
+						})
+
+						r.Post("/scan", libraryHandler.HandleScan)
+						r.Post("/scan/cancel", libraryHandler.HandleScanCancel)
+					})
+				}
+
+				// Browse, search, and item detail routes.
+				if itemsHandler != nil {
+					r.Get("/catalog", catalogHandler.HandleGetCatalog)
+					r.Get("/catalog/filters", catalogHandler.HandleGetCatalogFilters)
+					r.Get("/catalog/filters/search", catalogHandler.HandleGetCatalogFacetSearch)
+					r.Get("/catalog/audiobook-groups", catalogHandler.HandleGetAudiobookGroups)
+					r.Post("/catalog/query", catalogHandler.HandlePostCatalogQuery)
+					if literaryWorkHandler != nil {
+						r.Get("/works/{work_id}", literaryWorkHandler.HandleGetWork)
+					}
+					if catalogResourceHandler != nil {
+						r.Get("/catalog/items/{id}", catalogResourceHandler.HandleGetItemDetail)
+						r.Get("/catalog/items/{id}/episodes", catalogResourceHandler.HandleGetItemEpisodes)
+						r.Get("/catalog/items/{id}/versions", catalogResourceHandler.HandleGetItemVersions)
+						r.Get("/catalog/items/{id}/manga-files", catalogResourceHandler.HandleGetMangaFiles)
+						r.Get("/catalog/series/{id}/seasons", catalogResourceHandler.HandleGetSeasons)
+						r.Get("/catalog/series/{id}/seasons/{num}", catalogResourceHandler.HandleGetSeason)
+						r.Get("/catalog/series/{id}/seasons/{num}/episodes", catalogResourceHandler.HandleGetEpisodes)
+					}
+					r.Get("/watch/{id}", itemsHandler.HandleGetWatchDetail)
+				}
+
+				if calendarRepo != nil {
+					calendarPopular := recommendations.NewRepo(deps.DB)
+					calendarTrending := sections.NewTrendingSnapshotRepository(deps.DB)
+					calendarHandler := handlers.NewCalendarHandler(calendarRepo, detailSvc, calendarPopular, calendarTrending)
+					r.With(apimw.RequireProfile).Get("/calendar", calendarHandler.HandleGetCalendar)
+				}
+
+				if peopleHandler != nil {
+					r.Get("/people", peopleHandler.HandleSearch)
+					r.Get("/people/{id}", peopleHandler.HandleGetPerson)
+					r.Post("/people/{id}/refresh", peopleHandler.HandleRefreshPerson)
+				}
+
+				if libraryCollectionHandler != nil {
+					r.Get("/library/{id}/collections", libraryCollectionHandler.HandleListLibraryCollections)
+					r.Get("/library/{id}/collections/{collection_id}/items", libraryCollectionHandler.HandleGetLibraryCollectionItems)
+					r.Get("/library/{id}/user-collections", libraryCollectionHandler.HandleListLibraryUserCollections)
+				}
+
+				// Profile routes.
+				if profileHandler != nil {
+					r.Route("/profiles", func(r chi.Router) {
+						r.Get("/household/sessions", profileHandler.HandleListHouseholdSessions)
+						r.Get("/", profileHandler.HandleListProfiles)
+						r.Post("/", profileHandler.HandleCreateProfile)
+						r.Put("/{id}", profileHandler.HandleUpdateProfile)
+						r.Delete("/{id}", profileHandler.HandleDeleteProfile)
+						r.Put("/{id}/avatar", profileHandler.HandleUploadAvatar)
+						r.Delete("/{id}/avatar", profileHandler.HandleDeleteAvatar)
+						r.Post("/{id}/verify-pin", profileHandler.HandleVerifyPIN)
+					})
+				}
+
+				// The viewer's own device registry. Distinct from the push
+				// device routes under /notifications and from the TV login
+				// pairing flow under /auth/device: this is the installation
+				// identity that carries device-scoped settings.
+				if deviceHandler != nil {
+					r.Route("/devices", func(r chi.Router) {
+						r.Use(apimw.RequireProfile)
+						r.Get("/", deviceHandler.HandleListDevices)
+						r.Delete("/{device_id}", deviceHandler.HandleForgetDevice)
+						r.Delete("/{device_id}/settings", deviceHandler.HandleClearDeviceSettings)
+					})
+				}
+
+				// Favorites, watchlist, and history routes (profile-scoped).
+				if personalDataHandler != nil && itemsHandler != nil {
+					r.Route("/watched", func(r chi.Router) {
+						r.Use(apimw.RequireProfile)
+						r.Post("/{id}", itemsHandler.HandleMarkWatched)
+						r.Delete("/{id}", itemsHandler.HandleMarkUnwatched)
+					})
+
+					r.Route("/favorites", func(r chi.Router) {
+						r.Use(apimw.RequireProfile)
+						r.Get("/", personalDataHandler.HandleListFavorites)
+						r.Get("/{item_id}", personalDataHandler.HandleCheckFavorite)
+						r.Put("/{item_id}", personalDataHandler.HandleAddFavorite)
+						r.Delete("/{item_id}", personalDataHandler.HandleRemoveFavorite)
+					})
+
+					r.Route("/watchlist", func(r chi.Router) {
+						r.Use(apimw.RequireProfile)
+						r.Get("/", personalDataHandler.HandleListWatchlist)
+						r.Get("/{item_id}", personalDataHandler.HandleCheckWatchlist)
+						r.Put("/{item_id}", personalDataHandler.HandleAddToWatchlist)
+						r.Delete("/{item_id}", personalDataHandler.HandleRemoveFromWatchlist)
+					})
+
+					r.Route("/history", func(r chi.Router) {
+						r.Use(apimw.RequireProfile)
+						r.Get("/", personalDataHandler.HandleListHistory)
+						r.Post("/remove", personalDataHandler.HandleRemoveHistory)
+					})
+
+					// Ratings routes (profile-scoped).
+					if ratingsHandler != nil {
+						r.Route("/ratings", func(r chi.Router) {
+							r.Use(apimw.RequireProfile)
+							r.Get("/", ratingsHandler.HandleListRatings)
+							r.Get("/{item_id}", ratingsHandler.HandleGetRating)
+							r.Put("/{item_id}", ratingsHandler.HandleSetRating)
+							r.Delete("/{item_id}", ratingsHandler.HandleDeleteRating)
+						})
+					}
+				}
+
+				// Progress and sync routes (profile-scoped).
+				if progressHandler != nil {
+					r.Route("/progress", func(r chi.Router) {
+						r.Use(apimw.RequireProfile)
+						r.Get("/", progressHandler.HandleListProgress)
+					})
+
+					r.Route("/sync", func(r chi.Router) {
+						r.Use(apimw.RequireProfile)
+						r.Post("/progress", progressHandler.HandleSyncProgress)
+					})
+				}
+
+				// Collection routes (profile-scoped).
+				if collectionHandler != nil {
+					var userImportHandler *handlers.UserCollectionImportHandler
+					if deps.UserCollectionSync != nil {
+						userImportHandler = handlers.NewUserCollectionImportHandler(
+							deps.UserStoreProvider,
+							deps.UserCollectionSync,
+							deps.UserCollectionScheduler,
+							nil,
+							deps.MDBListClient,
+							deps.S3Public,
+							deps.FrontendFS,
+							4*time.Hour,
+						)
+					}
+					r.Route("/collections", func(r chi.Router) {
+						r.Use(apimw.RequireProfile)
+						r.Get("/", collectionHandler.HandleListCollections)
+						r.Get("/capabilities", collectionHandler.HandleCapabilities)
+						if libraryCollectionHandler != nil {
+							// Aggregated server (admin-curated) collections across
+							// every accessible library. Separate from "/" (personal,
+							// editable) by design — different access + cache lifecycle.
+							r.Get("/server", libraryCollectionHandler.HandleListServerCollections)
+						}
+						r.Post("/", collectionHandler.HandleCreateCollection)
+						r.Post("/preview", collectionHandler.HandlePreviewCollection)
+						r.Put("/order", collectionHandler.HandleReorderCollections)
+						r.Post("/groups", collectionHandler.HandleCreateCollectionGroup)
+						r.Put("/groups/order", collectionHandler.HandleReorderCollectionGroups)
+						r.Put("/groups/{id}", collectionHandler.HandleUpdateCollectionGroup)
+						r.Delete("/groups/{id}", collectionHandler.HandleDeleteCollectionGroup)
+						if userImportHandler != nil {
+							r.Get("/templates", userImportHandler.HandleListTemplates)
+							r.Get("/import/mdblist/search", userImportHandler.HandleSearchMDBList)
+							r.Get("/import/mdblist/top", userImportHandler.HandleTopMDBList)
+							r.Post("/import/mdblist", userImportHandler.HandleImportMDBList)
+							r.Post("/import/tmdb", userImportHandler.HandleImportTMDB)
+							r.Post("/import/trakt", userImportHandler.HandleImportTrakt)
+							r.Post("/{id}/sync", userImportHandler.HandleSync)
+						}
+						r.Put("/{id}", collectionHandler.HandleUpdateCollection)
+						r.Delete("/{id}", collectionHandler.HandleDeleteCollection)
+						r.Delete("/{id}/image", collectionHandler.HandleDeleteCollectionImage)
+						r.Get("/{id}/items", collectionHandler.HandleListCollectionItems)
+						r.Put("/{id}/items/order", collectionHandler.HandleReorderCollectionItems)
+						r.Put("/{id}/items/{item_id}", collectionHandler.HandleAddCollectionItem)
+						r.Delete("/{id}/items/{item_id}", collectionHandler.HandleRemoveCollectionItem)
+					})
+				}
+
+				if homeDismissalHandler != nil {
+					r.Route("/home/dismissals", func(r chi.Router) {
+						r.Use(apimw.RequireProfile)
+						r.Put("/{surface}/{item_id}", homeDismissalHandler.HandleUpsertDismissal)
+						r.Delete("/{surface}/{item_id}", homeDismissalHandler.HandleDeleteDismissal)
+					})
+				}
+
+				if watchProviderHandler != nil {
+					r.Route("/watch-providers", func(r chi.Router) {
+						r.Use(apimw.RequireProfile)
+						r.Get("/", watchProviderHandler.HandleListProviders)
+						r.Get("/{provider}/connection", watchProviderHandler.HandleGetConnection)
+						r.Patch("/{provider}/connection", watchProviderHandler.HandleUpdateConnection)
+						r.Delete("/{provider}/connection", watchProviderHandler.HandleDeleteConnection)
+						r.Post("/{provider}/auth/device-code", watchProviderHandler.HandleStartDeviceAuth)
+						r.Post("/{provider}/auth/poll", watchProviderHandler.HandlePollDeviceAuth)
+						r.Post("/{provider}/auth/api-key", watchProviderHandler.HandleConnectAPIKey)
+						r.Post("/{provider}/sync", watchProviderHandler.HandleManualSync)
+						r.Get("/{provider}/sync-runs", watchProviderHandler.HandleListSyncRuns)
+					})
+				}
+
+				if requestHandler != nil {
+					r.Route("/requests", func(r chi.Router) {
+						r.Use(apimw.RequireProfile)
+						r.Get("/search", requestHandler.HandleSearch)
+						r.Get("/discover", requestHandler.HandleDiscover)
+						r.Get("/discover/studios", requestHandler.HandleListStudios)
+						r.Get("/discover/networks", requestHandler.HandleListNetworks)
+						r.Get("/discover/genres", requestHandler.HandleListGenres)
+						r.Get("/discover/browse/studio/{slug}", requestHandler.HandleBrowseStudio)
+						r.Get("/discover/browse/network/{slug}", requestHandler.HandleBrowseNetwork)
+						r.Get("/discover/browse/genre/{slug}", requestHandler.HandleBrowseGenre)
+						r.Get("/discover/{section}", requestHandler.HandleDiscoverSection)
+						r.Get("/detail/{media_type}/{tmdb_id}", requestHandler.HandleGetDetail)
+						r.Get("/status", requestHandler.HandleGetStatus)
+						r.Post("/", requestHandler.HandleCreate)
+						r.Get("/mine", requestHandler.HandleListMine)
+						r.Get("/{id}", requestHandler.HandleGet)
+						r.Post("/{id}/cancel", requestHandler.HandleCancel)
+					})
+				}
+
+				// Onboarding tour routes (profile-scoped).
+				if onboardingHandler != nil {
+					r.Route("/onboarding", func(r chi.Router) {
+						r.Use(apimw.RequireProfile)
+						r.Get("/flow", onboardingHandler.HandleGetFlow)
+						r.Get("/state", onboardingHandler.HandleGetState)
+						r.Post("/progress", onboardingHandler.HandlePostProgress)
+					})
+				}
+
+				// Settings routes (user-scoped, no profile required).
+				if settingsHandler != nil {
+					r.Route("/settings", func(r chi.Router) {
+						if deps.PluginUserConfig != nil && deps.PluginService != nil {
+							pluginHandler := handlers.NewPluginHandler(
+								plugins.NewRepositoryStore(deps.DB),
+								plugins.NewInstallationStore(deps.DB),
+								plugins.NewRuntimeConfigStore(deps.DB, deps.SecretCipher),
+								deps.PluginService,
+								deps.PluginUserConfig,
+								deps.PluginHTTPProxy,
+								metadata.NewChainRepository(deps.DB),
+								deps.PluginImageResolver,
+								restartStatus,
+							)
+							r.Get("/plugins", pluginHandler.HandleListUserPluginSettings)
+							r.Get("/plugins/{installation_id}", pluginHandler.HandleGetUserPluginSettings)
+							r.Put("/plugins/{installation_id}", pluginHandler.HandlePutUserPluginSettings)
+						}
+						r.Get("/", settingsHandler.HandleListSettings)
+						r.Get("/overlay-config", settingsHandler.HandleGetOverlayConfig)
+						r.Group(func(r chi.Router) {
+							r.Use(apimw.RequireProfile)
+							r.Get("/effective", settingsHandler.HandleGetEffectiveSettings)
+							r.Get("/subtitle_appearance/effective", settingsHandler.HandleGetEffectiveSubtitleAppearance)
+							r.Put("/device/subtitle_appearance", settingsHandler.HandleSetSubtitleAppearanceDeviceOverride)
+							r.Delete("/device/subtitle_appearance", settingsHandler.HandleDeleteSubtitleAppearanceDeviceOverride)
+							r.Get("/device/{key}", settingsHandler.HandleGetDeviceSetting)
+							r.Put("/device/{key}", settingsHandler.HandleSetDeviceSetting)
+							r.Delete("/device/{key}", settingsHandler.HandleDeleteDeviceSetting)
+						})
+						// The canonical settings API. Registered before the
+						// catch-all /{key} routes below, which would otherwise
+						// swallow "contract" and "values" as setting names.
+						if settingValuesHandler != nil {
+							r.Get("/contract", settingValuesHandler.HandleGetContract)
+							r.Get("/contract/capabilities", settingValuesHandler.HandleGetCapabilities)
+							// The contract spec names these paths, and a new
+							// client detects a pre-contract server by the
+							// absence of GET /settings/manifest — a 404 here
+							// would read as "this server still needs
+							// upgrading" forever.
+							r.Get("/manifest", settingValuesHandler.HandleGetContract)
+							r.Get("/capability", settingValuesHandler.HandleGetCapabilities)
+							r.Group(func(r chi.Router) {
+								r.Use(apimw.RequireProfile)
+								r.Get("/values", settingValuesHandler.HandleGetValues)
+								r.Get("/values/effective", settingValuesHandler.HandleGetEffective)
+								r.Post("/values/effective", settingValuesHandler.HandlePostEffective)
+								r.Put("/values/nav.shortcuts/item", settingValuesHandler.HandleSetNavigationShortcut)
+								r.Get("/values/{key}", settingValuesHandler.HandleGetValue)
+								r.Put("/values/{key}", settingValuesHandler.HandleSetValue)
+								r.Delete("/values/{key}", settingValuesHandler.HandleDeleteValue)
+							})
+						}
+
+						r.Get("/{key}", settingsHandler.HandleGetSetting)
+						r.Put("/{key}", settingsHandler.HandleSetSetting)
+						r.Delete("/{key}", settingsHandler.HandleDeleteSetting)
+					})
+				}
+
+				if historyImportHandler != nil {
+					r.Route("/history-imports", func(r chi.Router) {
+						r.Get("/sources", historyImportHandler.HandleListSources)
+						r.Post("/emby-connect/login", historyImportHandler.HandleLoginConnect)
+						r.Post("/plex/auth/pin", historyImportHandler.HandleCreatePlexPin)
+						r.Post("/plex/auth/check", historyImportHandler.HandleCheckPlexPin)
+						r.Get("/runs", historyImportHandler.HandleListRuns)
+						r.Post("/runs", historyImportHandler.HandleCreateRun)
+						r.Get("/runs/{id}", historyImportHandler.HandleGetRun)
+					})
+				}
+				if webhookSyncHandler != nil {
+					r.Route("/plex-sync", func(r chi.Router) {
+						r.Get("/connections", webhookSyncHandler.HandleLegacyListConnections)
+						r.Post("/connections", webhookSyncHandler.HandleLegacyCreateConnection)
+						r.Delete("/connections/{id}", webhookSyncHandler.HandleLegacyDeleteConnection)
+						r.Post("/connections/{id}/webhook/rotate", webhookSyncHandler.HandleLegacyRotateWebhook)
+						r.Get("/connections/{id}/actors", webhookSyncHandler.HandleLegacyGetActors)
+						r.Put("/connections/{id}/actors", webhookSyncHandler.HandleLegacyUpdateActors)
+					})
+					r.Route("/webhook-sync", func(r chi.Router) {
+						r.Get("/connections", webhookSyncHandler.HandleListConnections)
+						r.Post("/connections", webhookSyncHandler.HandleCreateConnection)
+						r.Put("/connections/{id}", webhookSyncHandler.HandleUpdateConnection)
+						r.Delete("/connections/{id}", webhookSyncHandler.HandleDeleteConnection)
+						r.Post("/connections/{id}/webhook/rotate", webhookSyncHandler.HandleRotateWebhook)
+						r.Get("/connections/{id}/events", webhookSyncHandler.HandleListEvents)
+						r.Get("/connections/{id}/profile-mappings", webhookSyncHandler.HandleGetProfileMappings)
+						r.Put("/connections/{id}/profile-mappings", webhookSyncHandler.HandleUpdateProfileMappings)
+					})
+				}
+
+				// Subtitle preference routes (profile-scoped).
+				if subtitlePrefHandler != nil {
+					r.Route("/subtitle-prefs", func(r chi.Router) {
+						r.Use(apimw.RequireProfile)
+						r.Get("/{series_id}", subtitlePrefHandler.HandleGetSubtitlePref)
+						r.Put("/{series_id}", subtitlePrefHandler.HandleSetSubtitlePref)
+						r.Delete("/{series_id}", subtitlePrefHandler.HandleDeleteSubtitlePref)
+					})
+				}
+
+				// Audio preference routes (profile-scoped).
+				if audioPrefHandler != nil {
+					r.Route("/audio-prefs", func(r chi.Router) {
+						r.Use(apimw.RequireProfile)
+						r.Get("/{series_id}", audioPrefHandler.HandleGetAudioPref)
+						r.Put("/{series_id}", audioPrefHandler.HandleSetAudioPref)
+						r.Delete("/{series_id}", audioPrefHandler.HandleDeleteAudioPref)
+					})
+				}
+
+				// Library playback preference routes (profile-scoped).
+				if libraryPlaybackPrefHandler != nil {
+					r.Route("/library-playback-prefs", func(r chi.Router) {
+						r.Use(apimw.RequireProfile)
+						r.Get("/", libraryPlaybackPrefHandler.HandleListLibraryPlaybackPrefs)
+						r.Put("/{library_id}", libraryPlaybackPrefHandler.HandleSetLibraryPlaybackPref)
+						r.Delete("/{library_id}", libraryPlaybackPrefHandler.HandleDeleteLibraryPlaybackPref)
+					})
+				}
+
+				if ebookReaderHandler != nil {
+					r.Route("/ebooks", func(r chi.Router) {
+						r.Use(apimw.RequireProfile)
+						r.Get("/capability", ebookReaderHandler.HandleConversionCapability)
+						r.Get("/{content_id}/files/{file_id}/read", ebookReaderHandler.HandleReadFile)
+						r.Head("/{content_id}/files/{file_id}/read", ebookReaderHandler.HandleReadFile)
+						r.Get("/{content_id}/progress", ebookReaderHandler.HandleGetProgress)
+						r.Put("/{content_id}/progress", ebookReaderHandler.HandleSaveProgress)
+						r.Get("/{content_id}/reader-config", ebookReaderHandler.HandleGetConfig)
+						r.Put("/{content_id}/reader-config", ebookReaderHandler.HandleSaveConfig)
+						r.Get("/{content_id}/annotations", ebookReaderHandler.HandleListAnnotations)
+						r.Post("/{content_id}/annotations", ebookReaderHandler.HandleCreateAnnotation)
+						r.Patch("/{content_id}/annotations/{annotation_id}", ebookReaderHandler.HandleUpdateAnnotation)
+						r.Delete("/{content_id}/annotations/{annotation_id}", ebookReaderHandler.HandleDeleteAnnotation)
+					})
+				}
+
+				// Metadata AI translation availability probe (the metadata editor
+				// and detail pages show or hide their translate actions based on
+				// this) plus the viewer-facing on-view translation trigger.
+				if metadataAIHandler != nil {
+					r.Get("/metadata/ai/status", metadataAIHandler.HandleStatus)
+					if itemRepo != nil {
+						metadataAIHandler.ItemAccess = itemRepo
+						metadataAIHandler.SeasonLookup = seasonRepo
+						metadataAIHandler.EpisodeLookup = episodeRepo
+						r.Post("/items/{id}/translate-description", metadataAIHandler.HandleTranslateOnView)
+					}
+				} else {
+					r.Get("/metadata/ai/status", handlers.WriteMetadataAIDisabledStatus)
+				}
+
+				// Viewer-facing trailer fetch. Registered beside the on-view
+				// translation trigger because it is the same shape: a
+				// non-admin, item-scoped metadata action guarded by item
+				// access plus a per-user limiter, with the real budget being
+				// the per-item cooldown the metadata service enforces.
+				//
+				// The action route is conditional (it needs the metadata
+				// service to implement the optional interface), so the
+				// capability probe beside it is not: per the v1 rules a client
+				// feature-detects rather than version-sniffs, and a probe that
+				// itself 404s would leave it interpreting the same ambiguous
+				// status it was meant to replace. Unwired, the probe answers
+				// refresh:false.
+				if itemsHandler != nil && itemRepo != nil {
+					if requester, ok := deps.MetadataService.(handlers.TrailerRefreshRequester); ok {
+						// Share the process's configured limiter so the
+						// per-user budget is one budget on Redis deployments
+						// rather than one per instance. Nil when rate limiting
+						// is disabled; the handler then keeps its private
+						// in-memory fallback.
+						itemsHandler.SetTrailerRefreshLimiter(deps.RateLimitMW.SharedLimiter())
+						itemsHandler.SetTrailerRefreshRequester(requester)
+						r.Post("/items/{id}/trailers/refresh", itemsHandler.HandleRequestTrailersRefresh)
+					}
+					r.Get("/items/trailers/capability", itemsHandler.HandleTrailerRefreshCapability)
+				}
+
+				// Subtitle search + AI translation routes.
+				if subtitleSearchHandler != nil {
+					if deps.FileRepo != nil && itemRepo != nil {
+						fileAuthorizer := &handlers.MediaFileAuthorizer{
+							FileResolver:  deps.FileRepo,
+							ItemAccess:    itemRepo,
+							EpisodeLookup: episodeRepo,
+							ExtraLookup:   extraRepo,
+						}
+						subtitleSearchHandler.FileAuthorizer = fileAuthorizer
+						if subtitleAIHandler != nil {
+							subtitleAIHandler.FileAuthorizer = fileAuthorizer
+						}
+					}
+					r.Route("/subtitles", func(r chi.Router) {
+						r.Post("/search", subtitleSearchHandler.HandleSearch)
+						r.Post("/download", subtitleSearchHandler.HandleDownload)
+						r.Post("/upload", subtitleSearchHandler.HandleUpload)
+						r.Post("/detect-language", subtitleSearchHandler.HandleDetectLanguage)
+						if subtitleAIHandler != nil {
+							r.Get("/ai/status", subtitleAIHandler.HandleStatus)
+							r.Get("/ai/quota", subtitleAIHandler.HandleQuota)
+							r.Post("/ai/translate", subtitleAIHandler.HandleTranslate)
+							r.Get("/ai/jobs", subtitleAIHandler.HandleListJobs)
+							r.Get("/ai/jobs/{job_id}", subtitleAIHandler.HandleGetJob)
+							r.Post("/ai/jobs/{job_id}/cancel", subtitleAIHandler.HandleCancelJob)
+						} else {
+							// Answer the capability probe with 200 {"enabled": false}
+							// when AI translation isn't wired, so the client gets a
+							// clean negative instead of a 404.
+							r.Get("/ai/status", handlers.WriteSubtitleAIDisabledStatus)
+						}
+						r.Get("/{media_file_id}", subtitleSearchHandler.HandleList)
+						r.Delete("/{id}", subtitleSearchHandler.HandleDelete)
+					})
+				}
+
+				// Playback routes.
+				if playbackHandler != nil {
+					playbackHandler.ItemAccess = itemRepo
+					playbackHandler.EpisodeLookup = episodeRepo
+					playbackHandler.ExtraLookup = extraRepo
+					playbackHandler.OriginalLangLookup = itemRepo
+					playbackHandler.FFmpegLogSink = deps.FFmpegLogSink
+
+					r.Route("/playback", func(r chi.Router) {
+						r.Get("/capability", playbackHandler.HandlePlaybackCapabilityV3)
+						// HLS transcode delivery — no profile auth needed;
+						// session ID (UUID) serves as the access token, same
+						// pattern as /stream/{session_id}.
+						r.Get("/transcode/{session_id}/master.m3u8", playbackHandler.HandleGetTranscodeManifest)
+						r.Get("/transcode/{session_id}/segment/{name}", playbackHandler.HandleGetTranscodeSegment)
+
+						// Playback realtime control socket — needs auth but not profile.
+						r.Get("/sessions/{session_id}/control/ws", playbackHandler.HandleSessionWebSocket)
+
+						// All mutation routes require profile auth.
+						r.Group(func(r chi.Router) {
+							r.Use(apimw.RequireProfile)
+							r.Post("/start", playbackHandler.HandleStartPlayback)
+							r.Post("/{session_id}/replan", playbackHandler.HandleReplanPlaybackV3)
+							r.Post("/route-events", playbackHandler.HandlePlaybackRouteEventV3)
+							r.Post("/{session_id}/progress", playbackHandler.HandleUpdateProgress)
+							r.Delete("/{session_id}", playbackHandler.HandleStopPlayback)
+						})
+					})
+				}
+
+				if watchTogetherHandler != nil {
+					r.Route("/watch-together", func(r chi.Router) {
+						r.Get("/rooms/{room_id}/ws", watchTogetherHandler.HandleRoomWebSocket)
+						r.Group(func(r chi.Router) {
+							r.Use(apimw.RequireProfile)
+							r.Post("/rooms", watchTogetherHandler.HandleCreateRoom)
+							r.Post("/join", watchTogetherHandler.HandleJoinRoom)
+							r.Get("/rooms/{room_id}", watchTogetherHandler.HandleGetRoom)
+							r.Put("/rooms/{room_id}/selection", watchTogetherHandler.HandleSelectRoomItem)
+							r.Patch("/rooms/{room_id}/policy", watchTogetherHandler.HandleUpdateRoomPolicy)
+							r.Delete("/rooms/{room_id}", watchTogetherHandler.HandleCloseRoom)
+							r.Get("/rooms/{room_id}/suggestions", watchTogetherHandler.HandleListSuggestions)
+							r.Post("/rooms/{room_id}/suggestions", watchTogetherHandler.HandleCreateSuggestion)
+							r.Delete("/rooms/{room_id}/suggestions/{suggestion_id}", watchTogetherHandler.HandleDeleteSuggestion)
+							r.Post("/rooms/{room_id}/suggestions/{suggestion_id}/vote", watchTogetherHandler.HandleVote)
+							r.Delete("/rooms/{room_id}/suggestions/{suggestion_id}/vote", watchTogetherHandler.HandleUnvote)
+							r.Post("/rooms/{room_id}/suggestions/promote", watchTogetherHandler.HandlePromoteSuggestion)
+						})
+					})
+				}
+
+				// Stream routes.
+				if streamHandler != nil {
+					r.Get("/stream/{session_id}", streamHandler.HandleStream)
+					r.Head("/stream/{session_id}", streamHandler.HandleStream)
+					r.Get("/stream/{session_id}/subtitles/{track}", streamHandler.HandleSubtitle)
+					r.Head("/stream/{session_id}/subtitles/{track}", streamHandler.HandleSubtitle)
+					r.Get("/stream/{session_id}/subtitles/{track}/fonts", streamHandler.HandleSubtitleFonts)
+				}
+
+				// Download routes.
+				if policyHandler != nil {
+					r.Get("/policy/capability", policyHandler.HandleCapability)
+				}
+				r.Route("/downloads", func(r chi.Router) {
+					r.Get("/capability", downloadHandler.HandleCapability)
+					r.Post("/", downloadHandler.HandleCreateDownload)
+					r.Get("/", downloadHandler.HandleListDownloads)
+					// Series monitoring (auto-download) subscriptions.
+					r.Post("/subscriptions", downloadHandler.HandleCreateSubscription)
+					r.Post("/subscriptions/sync", downloadHandler.HandleSyncSubscriptions)
+					r.Get("/subscriptions", downloadHandler.HandleListSubscriptions)
+					r.Get("/subscriptions/{id}", downloadHandler.HandleGetSubscription)
+					r.Patch("/subscriptions/{id}", downloadHandler.HandlePatchSubscription)
+					r.Delete("/subscriptions/{id}", downloadHandler.HandleDeleteSubscription)
+					r.Get("/batches/{batch_id}/manifests", downloadHandler.HandleBatchManifests)
+					r.Patch("/{id}", downloadHandler.HandlePatchDownload)
+					r.Delete("/{id}", downloadHandler.HandleDeleteDownload)
+					// GET+HEAD: background download stacks probe with HEAD
+					// before issuing ranged GETs; http.ServeContent handles
+					// HEAD natively.
+					r.Get("/{id}/file", downloadHandler.HandleDownloadFile)
+					r.Head("/{id}/file", downloadHandler.HandleDownloadFile)
+					r.Get("/{id}/manifest", downloadHandler.HandleManifest)
+					r.Get("/{id}/artwork/{kind}", downloadHandler.HandleArtwork)
+					r.Get("/{id}/subtitles/{ref}", downloadHandler.HandleSubtitle)
+				})
+				r.Get("/direct-download", downloadHandler.HandleDirectDownload)
+				r.Head("/direct-download", downloadHandler.HandleDirectDownload)
+
+				// Recipe gallery catalog (no profile required — purely static metadata).
+				recipeHandler := &handlers.RecipeHandler{}
+				r.Get("/sections/recipes", recipeHandler.HandleList)
+				r.Get("/sections/recipes/{type}/candidates", recipeHandler.HandleCandidates)
+
+				// Section endpoints (profile-scoped).
+				if sectionHandler != nil {
+					r.Group(func(r chi.Router) {
+						r.Use(apimw.RequireProfile)
+						r.Get("/home/layout", sectionHandler.HandleHomeLayout)
+						r.Get("/home/sections", sectionHandler.HandleHomeSections)
+						r.Get("/home/sections/{id}/items", sectionHandler.HandleHomeSectionItems)
+						r.Get("/library/{id}/layout", sectionHandler.HandleLibraryLayout)
+						r.Get("/library/{id}/sections", sectionHandler.HandleLibrarySections)
+						r.Get("/library/{id}/sections/{sectionId}/items", sectionHandler.HandleLibrarySectionItems)
+					})
+
+					r.Route("/profile/sections", func(r chi.Router) {
+						r.Use(apimw.RequireProfile)
+						r.Get("/", sectionHandler.HandleGetProfileOverrides)
+						r.Put("/", sectionHandler.HandleSaveProfileOverrides)
+						r.Delete("/reset", sectionHandler.HandleResetProfileOverrides)
+						r.Get("/settings", sectionHandler.HandleSectionSettings)
+						if sectionSettingsHandler != nil {
+							r.Get("/flags", sectionSettingsHandler.HandleGetProfileFlag)
+						}
+					})
+				}
+
+				// Recommendation routes (profile-scoped).
+				if recsHandler != nil {
+					r.Route("/recommendations", func(r chi.Router) {
+						r.Use(apimw.RequireProfile)
+						r.Get("/for-you/main", recsHandler.HandleForYouMain)
+						r.Get("/for-you/rows", recsHandler.HandleForYouRows)
+						r.Get("/because-watched/{item_id}", recsHandler.HandleBecauseWatched)
+						r.Get("/similar/{item_id}", recsHandler.HandleSimilar)
+						r.Get("/similar-users", recsHandler.HandleSimilarUsers)
+						r.Get("/taste-profile", recsHandler.HandleTasteProfile)
+						r.Get("/popular", recsHandler.HandlePopular)
+						r.Get("/recently-added", recsHandler.HandleRecentlyAdded)
+						r.Get("/discover", recsHandler.HandleDiscover)
+						r.Get("/section/{kind}", recsHandler.HandleSection)
+						r.Get("/section/{kind}/{key}", recsHandler.HandleSection)
+						r.Get("/watch-tonight", recsHandler.HandleWatchTonight)
+						r.Get("/watch-tonight/cards", recsHandler.HandleWatchTonightCards)
+						r.Get("/taste-seed/items", recsHandler.HandleTasteSeedItems)
+						r.Post("/taste-seed", recsHandler.HandleTasteSeed)
+					})
+				}
+
+				// Admin routes.
+				if adminHandler != nil {
+					r.Route("/admin", func(r chi.Router) {
+						metadataItemAccess := requireActingAdmin
+						if metadataCurationAccess != nil {
+							metadataItemAccess = metadataCurationAccess
+						}
+
+						r.Group(func(r chi.Router) {
+							r.Use(metadataItemAccess)
+							r.Post("/items/{id}/refresh-metadata", adminHandler.HandleRefreshItemMetadata)
+							r.Patch("/items/{id}/metadata", adminHandler.HandleUpdateItemMetadata)
+							if adminMatchHandler != nil {
+								r.Post("/items/{id}/match/search", adminMatchHandler.HandleSearchItemMatchCandidates)
+								r.Post("/items/{id}/match/apply", adminMatchHandler.HandleApplyItemMatch)
+							}
+							if adminSplitHandler != nil {
+								r.Get("/items/{id}/files", adminSplitHandler.HandleListItemFiles)
+								r.Post("/items/{id}/split", adminSplitHandler.HandleSplitItem)
+								r.Post("/items/{id}/merge", adminSplitHandler.HandleMergeItem)
+							}
+							if metadataAIHandler != nil {
+								r.Post("/items/{id}/metadata-translation", metadataAIHandler.HandleTranslate)
+								r.Get("/items/{id}/metadata-translation/jobs", metadataAIHandler.HandleListJobs)
+								r.Post("/items/{id}/metadata-translation/jobs/{job_id}/cancel", metadataAIHandler.HandleCancelJob)
+							}
+						})
+
+						if adminJobsHandler != nil {
+							// Curators must poll their own item-refresh jobs, so this stays outside
+							// the admin-only group. HandleGet enforces per-job authorization.
+							r.Get("/jobs/{id}", adminJobsHandler.HandleGet)
+						}
+
+						r.Group(func(r chi.Router) {
+							r.Use(requireActingAdmin)
+
+							r.Get("/users", adminHandler.HandleListUsers)
+							r.Post("/users", adminHandler.HandleCreateUser)
+							r.Get("/users/{id}", adminHandler.HandleGetUser)
+							r.Put("/users/{id}", adminHandler.HandleUpdateUser)
+							r.Delete("/users/{id}", adminHandler.HandleDeleteUser)
+							r.Post("/users/{id}/impersonate", adminHandler.HandleImpersonateUser)
+							r.Get("/users/{id}/profiles", adminHandler.HandleListUserProfiles)
+							// The canonical settings API's admin projection. It
+							// replaced the string-registry /users/{id}/settings*
+							// and device-settings* routes (see the pre-lock
+							// removals table in docs/architecture/v1-scope.md):
+							// one list across every scope, and set/delete at an
+							// explicit scope named in the query string.
+							if settingValuesHandler != nil {
+								r.Get("/users/{id}/settings/values", settingValuesHandler.HandleAdminListUserSettingValues)
+								r.Put("/users/{id}/settings/values/{key}", settingValuesHandler.HandleAdminSetUserSettingValue)
+								r.Delete("/users/{id}/settings/values/{key}", settingValuesHandler.HandleAdminDeleteUserSettingValue)
+							}
+							r.Get("/devices", adminHandler.HandleListDevices)
+							r.Get("/devices/{user_id}/{device_id}", adminHandler.HandleGetDevice)
+							if accessGroupHandler != nil {
+								r.Get("/access-groups", accessGroupHandler.HandleList)
+								r.Post("/access-groups", accessGroupHandler.HandleCreate)
+								r.Get("/access-groups/{id}", accessGroupHandler.HandleGet)
+								r.Put("/access-groups/{id}", accessGroupHandler.HandleUpdate)
+								r.Delete("/access-groups/{id}", accessGroupHandler.HandleDelete)
+							}
+
+							r.Get("/sessions", adminHandler.HandleListSessions)
+							r.Get("/sessions/capabilities", adminHandler.HandleGetSessionsCapabilities)
+							r.Get("/playback-history", adminHandler.HandleListPlaybackHistory)
+							r.Get("/unmatched", adminHandler.HandleListUnmatched)
+							r.Get("/stats", adminHandler.HandleGetStats)
+							r.Get("/server/status", adminHandler.HandleGetServerStatus)
+							r.Get("/catalog/search/status", adminHandler.HandleGetCatalogSearchStatus)
+							if policyHandler != nil {
+								r.Route("/policy", func(r chi.Router) {
+									r.Get("/vendor", policyHandler.HandleListVendor)
+									r.Get("/documents", policyHandler.HandleListDocuments)
+									r.Post("/documents", policyHandler.HandleCreateDocument)
+									r.Get("/documents/{id}", policyHandler.HandleGetDocument)
+									r.Delete("/documents/{id}", policyHandler.HandleDeleteDocument)
+									r.Get("/documents/{id}/versions", policyHandler.HandleListVersions)
+									r.Post("/documents/{id}/versions", policyHandler.HandleCreateVersion)
+									r.Get("/documents/{id}/versions/{version}", policyHandler.HandleGetVersion)
+									r.Post("/documents/{id}/versions/{version}/activate", policyHandler.HandleActivateVersion)
+									r.Post("/documents/{id}/enabled", policyHandler.HandleSetDocumentEnabled)
+									r.Post("/validate", policyHandler.HandleValidate)
+									r.Post("/simulate", policyHandler.HandleSimulate)
+									r.Get("/decisions", policyHandler.HandleListDecisions)
+									r.Get("/decisions/{id}", policyHandler.HandleGetDecision)
+								})
+							}
+							if literaryWorkHandler != nil {
+								r.Get("/literary-works/items/{content_id}/candidates", literaryWorkHandler.HandleListCandidates)
+								r.Post("/literary-works/link", literaryWorkHandler.HandleLinkItems)
+								r.Delete("/literary-works/{work_id}/items/{content_id}", literaryWorkHandler.HandleUnlinkItem)
+								r.Post("/literary-works/matches/confirm", literaryWorkHandler.HandleConfirmMatch)
+								r.Post("/literary-works/matches/ignore", literaryWorkHandler.HandleIgnoreMatch)
+							}
+							r.Post("/server/restart", serverControlHandler.HandleRestart)
+							r.Get("/jellyfin-compat/status", adminHandler.HandleGetJellyfinCompatStatus)
+							r.Patch("/jellyfin-compat/settings", adminHandler.HandleUpdateJellyfinCompatSettings)
+							r.Post("/jellyfin-compat/web/install", adminHandler.HandleInstallJellyfinCompatWeb)
+							r.Post("/jellyfin-compat/web/update", adminHandler.HandleUpdateJellyfinCompatWeb)
+							r.Post("/jellyfin-compat/web/remove", adminHandler.HandleRemoveJellyfinCompatWeb)
+							r.Get("/settings/sensitive-status", adminHandler.HandleGetSensitiveStatus)
+							r.Post("/settings/check/{kind}", adminHandler.HandleCheckSettingsConnection)
+							if sectionSettingsHandler != nil {
+								r.Get("/settings/sections", sectionSettingsHandler.HandleGet)
+								r.Put("/settings/sections", sectionSettingsHandler.HandlePut)
+							}
+							r.Get("/settings/effective", adminHandler.HandleGetEffectiveSettings)
+							r.Get("/settings/{key}", adminHandler.HandleGetSetting)
+							r.Get("/settings", adminHandler.HandleGetSettings)
+							r.Put("/settings", adminHandler.HandleUpdateSettings)
+							r.Put("/settings/{key}", adminHandler.HandleUpdateSetting)
+							if brandingHandler != nil {
+								// Branding image upload/delete (scalar branding
+								// fields use the generic settings PUT above).
+								r.Post("/branding/assets/{kind}", brandingHandler.HandleUploadAsset)
+								r.Delete("/branding/assets/{kind}", brandingHandler.HandleDeleteAsset)
+							}
+							if settingsRepo != nil {
+								emailHandler := handlers.NewEmailHandler(mail.NewSMTPSender(settingsRepo))
+								r.Post("/email/test", emailHandler.HandleTest)
+							}
+							if discordNotificationsHandler != nil {
+								r.Post("/notifications/discord/test", discordNotificationsHandler.HandleAdminTest)
+							}
+							if deps.Notifications != nil || settingsRepo != nil {
+								applePushHandler := handlers.NewAdminApplePushHandler(deps.Notifications, settingsRepo)
+								if deps.Notifications != nil {
+									r.Post("/notifications/push/apple/test", applePushHandler.HandleTest)
+									r.Post("/notifications/push/fcm/test", applePushHandler.HandleTestAndroid)
+								}
+								if settingsRepo != nil {
+									r.Post("/notifications/push/relay/register", applePushHandler.HandleRegisterRelay)
+									r.Delete("/notifications/push/relay", applePushHandler.HandleClearRelay)
+								}
+							}
+							if deps.Notifications != nil && deps.Notifications.ServerChannels != nil {
+								serverChannelsHandler := handlers.NewAdminServerChannelsHandler(deps.Notifications)
+								r.Route("/notifications/server-channels", func(r chi.Router) {
+									r.Get("/", serverChannelsHandler.HandleList)
+									r.Post("/", serverChannelsHandler.HandleCreate)
+									r.Put("/{id}", serverChannelsHandler.HandleUpdate)
+									r.Delete("/{id}", serverChannelsHandler.HandleDelete)
+									r.Post("/{id}/rotate-secret", serverChannelsHandler.HandleRotateSecret)
+									r.Post("/{id}/test", serverChannelsHandler.HandleTest)
+								})
+							}
+							if adminIntroHandler != nil {
+								r.Post("/items/{id}/refresh-markers", adminIntroHandler.HandleRefreshEpisodeMarkers)
+								r.Post("/items/{id}/redetect-intro", adminIntroHandler.HandleRedetectEpisodeIntro)
+							}
+							if markersHandler != nil {
+								// Marker read/write/clear live on the authenticated
+								// /markers routes; writes require marker_edit.
+								// Contribution and audit history stay admin operations.
+								r.Post("/files/{fileId}/contribute", markersHandler.HandleContributeFile)
+								r.Get("/files/{fileId}/contributions", markersHandler.HandleListFileContributions)
+								r.Get("/markers/history", markersHandler.HandleListMarkerHistory)
+								r.Get("/markers/files/{fileId}/history", markersHandler.HandleListFileMarkerHistory)
+								r.Get("/markers/items/{id}/history", markersHandler.HandleListItemMarkerHistory)
+							}
+							if adminMarkerProvidersHandler != nil {
+								r.Get("/markers/providers", adminMarkerProvidersHandler.HandleListProviders)
+								r.Put("/markers/providers/{provider}", adminMarkerProvidersHandler.HandleUpdateProvider)
+								r.Post("/markers/providers/{provider}/validate", adminMarkerProvidersHandler.HandleValidateProvider)
+							}
+							if peopleHandler != nil {
+								r.Post("/people/{id}/refresh", peopleHandler.HandleAdminRefreshPerson)
+								r.Patch("/people/{id}", peopleHandler.HandleAdminUpdatePerson)
+							}
+
+							if adminImageHandler != nil {
+								r.Get("/items/{id}/images", adminImageHandler.HandleGetItemImages)
+								r.Post("/items/{id}/images/apply", adminImageHandler.HandleApplyItemImage)
+							}
+
+							filesystemHandler := handlers.NewFilesystemHandler()
+							r.Get("/filesystem/browse", filesystemHandler.HandleBrowse)
+
+							if catalogSeedHandler != nil {
+								r.Route("/catalog", func(r chi.Router) {
+									r.Post("/export", catalogSeedHandler.HandleExport)
+									r.Post("/export-jobs", catalogSeedHandler.HandleCreateExportJob)
+									r.Post("/export-jobs/{id}/publish", catalogSeedHandler.HandlePublishExportJob)
+									r.Post("/import-jobs", catalogSeedHandler.HandleCreateImportJob)
+									r.Get("/import-sources", catalogSeedHandler.HandleListImportSources)
+									r.Get("/local-import-sources", catalogSeedHandler.HandleListLocalImportSources)
+									r.Post("/import", catalogSeedHandler.HandleImport)
+								})
+							}
+
+							if adminJobsHandler != nil {
+								r.Route("/jobs", func(r chi.Router) {
+									r.Get("/", adminJobsHandler.HandleList)
+									r.Post("/{id}/cancel", adminJobsHandler.HandleCancel)
+								})
+							}
+
+							if deps.PluginService != nil && deps.PluginUserConfig != nil {
+								pluginHandler := handlers.NewPluginHandler(
+									plugins.NewRepositoryStore(deps.DB),
+									plugins.NewInstallationStore(deps.DB),
+									plugins.NewRuntimeConfigStore(deps.DB, deps.SecretCipher),
+									deps.PluginService,
+									deps.PluginUserConfig,
+									deps.PluginHTTPProxy,
+									metadata.NewChainRepository(deps.DB),
+									deps.PluginImageResolver,
+									restartStatus,
+								)
+								r.Route("/plugins", func(r chi.Router) {
+									r.Get("/catalog-settings", pluginHandler.HandleGetCatalogSettings)
+									r.Put("/catalog-settings", pluginHandler.HandlePutCatalogSettings)
+									r.Get("/repositories", pluginHandler.HandleListRepositories)
+									r.Post("/repositories", pluginHandler.HandleCreateRepository)
+									r.Put("/repositories/{id}", pluginHandler.HandleUpdateRepository)
+									r.Delete("/repositories/{id}", pluginHandler.HandleDeleteRepository)
+									r.Get("/catalog", pluginHandler.HandleCatalog)
+									r.Get("/installations", pluginHandler.HandleListInstallations)
+									r.Post("/installations", pluginHandler.HandleCreateInstallation)
+									r.Post("/uploads", pluginHandler.HandleUploadInstallation)
+									r.Post("/uploads/chunked", pluginHandler.HandleCreateChunkedUpload)
+									r.Put("/uploads/chunked/{upload_id}/chunks/{chunk_index}", pluginHandler.HandleUploadChunk)
+									r.Post("/uploads/chunked/{upload_id}/complete", pluginHandler.HandleCompleteChunkedUpload)
+									r.Delete("/uploads/chunked/{upload_id}", pluginHandler.HandleCancelChunkedUpload)
+									r.Put("/installations/{id}", pluginHandler.HandleUpdateInstallation)
+									r.Post("/installations/{id}/update", pluginHandler.HandleApplyUpdate)
+									r.Post("/installations/{id}/config/test", pluginHandler.HandleTestInstallationConfig)
+									r.Put("/installations/{id}/config", pluginHandler.HandlePutInstallationConfig)
+									r.Put("/installations/{id}/auth-binding", pluginHandler.HandlePutAuthBinding)
+									r.Put("/installations/{id}/task-bindings/{capability_id}", pluginHandler.HandlePutTaskBinding)
+									r.Delete("/installations/{id}", pluginHandler.HandleDeleteInstallation)
+								})
+							}
+
+							if historyImportHandler != nil {
+								r.Route("/history-import-sources", func(r chi.Router) {
+									r.Get("/", historyImportHandler.HandleAdminListSources)
+									r.Post("/", historyImportHandler.HandleAdminCreateSource)
+									r.Put("/{id}", historyImportHandler.HandleAdminUpdateSource)
+									r.Delete("/{id}", historyImportHandler.HandleAdminDeleteSource)
+								})
+
+								r.Route("/history-imports", func(r chi.Router) {
+									r.Post("/plex/login", historyImportHandler.HandleAdminPlexLogin)
+									r.Put("/sources/{id}/token", historyImportHandler.HandleAdminSetSourceToken)
+									r.Delete("/sources/{id}/token", historyImportHandler.HandleAdminClearSourceToken)
+									r.Get("/sources/{id}/users", historyImportHandler.HandleAdminDiscoverUsers)
+									r.Post("/sources/{id}/bulk-run", historyImportHandler.HandleAdminBulkRun)
+									r.Get("/mappings", historyImportHandler.HandleAdminListMappings)
+									r.Post("/mappings", historyImportHandler.HandleAdminCreateMapping)
+									r.Put("/mappings/{id}", historyImportHandler.HandleAdminUpdateMapping)
+									r.Delete("/mappings/{id}", historyImportHandler.HandleAdminDeleteMapping)
+									r.Post("/mappings/{id}/run", historyImportHandler.HandleAdminCreateRun)
+									r.Get("/runs", historyImportHandler.HandleAdminListRuns)
+									r.Get("/runs/{id}", historyImportHandler.HandleAdminGetRun)
+									r.Post("/runs/{id}/cancel", historyImportHandler.HandleAdminCancelRun)
+								})
+							}
+
+							if sectionHandler != nil {
+								r.Route("/sections", func(r chi.Router) {
+									r.Get("/", sectionHandler.HandleListSections)
+									r.Post("/", sectionHandler.HandleCreateSection)
+									r.Post("/preview", sectionHandler.HandlePreview)
+									r.Put("/reorder", sectionHandler.HandleReorderSections)
+									r.Post("/restore-defaults", sectionHandler.HandleRestoreDefaults)
+									r.Put("/{id}", sectionHandler.HandleUpdateSection)
+									r.Delete("/{id}", sectionHandler.HandleDeleteSection)
+									if sectionBulkHandler != nil {
+										r.Post("/bulk-create", sectionBulkHandler.HandleBulkCreate)
+									}
+								})
+							}
+
+							if libraryCollectionHandler != nil {
+								collectionTemplateHandler := handlers.NewCollectionTemplateHandler(nil)
+								r.Route("/collections", func(r chi.Router) {
+									r.Get("/", libraryCollectionHandler.HandleListAdminCollections)
+									r.Get("/templates", collectionTemplateHandler.HandleListTemplates)
+									r.Get("/template-bundles", libraryCollectionHandler.HandleListTemplateBundles)
+									r.Post("/template-bundles/{bundleID}/apply", libraryCollectionHandler.HandleApplyTemplateBundle)
+									r.Post("/template-bundles/{bundleID}/apply-job", libraryCollectionHandler.HandleApplyTemplateBundleJob)
+									r.Post("/", libraryCollectionHandler.HandleCreateAdminCollection)
+									r.Post("/preview", libraryCollectionHandler.HandlePreviewAdminCollection)
+									r.Put("/order", libraryCollectionHandler.HandleReorderAdminCollections)
+									r.Put("/{id}", libraryCollectionHandler.HandleUpdateAdminCollection)
+									r.Delete("/{id}", libraryCollectionHandler.HandleDeleteAdminCollection)
+									r.Post("/{id}/sync", libraryCollectionHandler.HandleSyncAdminCollection)
+									r.Delete("/{id}/image", libraryCollectionHandler.HandleDeleteCollectionImage)
+									r.Put("/{id}/items/order", libraryCollectionHandler.HandleReorderAdminCollectionItems)
+									r.Put("/{id}/items/{item_id}", libraryCollectionHandler.HandleAddAdminCollectionItem)
+									r.Delete("/{id}/items/{item_id}", libraryCollectionHandler.HandleRemoveAdminCollectionItem)
+									r.Post("/import/mdblist", libraryCollectionHandler.HandleImportMDBList)
+									r.Post("/import/tmdb", libraryCollectionHandler.HandleImportTMDBCollection)
+									r.Post("/import/trakt", libraryCollectionHandler.HandleImportTraktCollection)
+								})
+							}
+							if libraryCollectionGroupHandler != nil {
+								r.Route("/libraries/{libraryID}/collection-groups", func(r chi.Router) {
+									r.Get("/", libraryCollectionGroupHandler.HandleListGroups)
+									r.Post("/", libraryCollectionGroupHandler.HandleCreateGroup)
+									r.Put("/reorder", libraryCollectionGroupHandler.HandleReorderGroups)
+								})
+								r.Route("/collection-groups", func(r chi.Router) {
+									r.Put("/{id}", libraryCollectionGroupHandler.HandleUpdateGroup)
+									r.Delete("/{id}", libraryCollectionGroupHandler.HandleDeleteGroup)
+									r.Put("/{groupID}/collections/reorder", libraryCollectionGroupHandler.HandleReorderCollectionsInGroup)
+								})
+							}
+
+							if deps.NodeRepo != nil {
+								jwtSecret := ""
+								if deps.Config != nil {
+									jwtSecret = deps.Config.Auth.JWTSecret
+								}
+								nodeHandler := handlers.NewNodeHandler(deps.NodeRepo, deps.ProxyPool, deps.TranscodePool, deps.NodeRepo, deps.EventBus, deps.RedisClient, jwtSecret)
+								r.Route("/nodes", func(r chi.Router) {
+									r.Get("/", nodeHandler.HandleListNodes)
+									r.Post("/", nodeHandler.HandleCreateNode)
+									r.Put("/{id}", nodeHandler.HandleUpdateNode)
+									r.Delete("/{id}", nodeHandler.HandleDeleteNode)
+									r.Post("/{id}/check", nodeHandler.HandleCheckNode)
+									r.Post("/force-reload", nodeHandler.HandleForceReloadNodes)
+									r.Post("/{id}/force-reload", nodeHandler.HandleForceReloadNode)
+								})
+								// Live node sessions (reads from Redis)
+								// Note: /admin/sessions is already used for playback sessions from PostgreSQL.
+								r.Get("/node-sessions", nodeHandler.HandleListSessions)
+							}
+
+							// System inspection.
+							{
+								sysJWTSecret := ""
+								sysFFmpegPath := ""
+								if deps.Config != nil {
+									sysJWTSecret = deps.Config.Auth.JWTSecret
+									sysFFmpegPath = deps.Config.Playback.FFmpegPath
+								}
+								systemHandler := handlers.NewSystemHandler(deps.TranscodePool, sysJWTSecret, sysFFmpegPath)
+								r.Route("/system", func(r chi.Router) {
+									r.Get("/build", systemHandler.HandleBuildInfo)
+									r.Get("/hw-accel", systemHandler.HandleHWAccel)
+								})
+							}
+
+							if deps.RecWorker != nil {
+								adminRecsHandler := handlers.NewAdminRecommendationsHandler(deps.RecWorker)
+								r.Route("/recommendations", func(r chi.Router) {
+									r.Get("/status", adminRecsHandler.HandleStatus)
+									r.Post("/trigger/embeddings", adminRecsHandler.HandleTriggerEmbeddings)
+									r.Post("/trigger/taste-profiles", adminRecsHandler.HandleTriggerTasteProfiles)
+									r.Post("/trigger/cowatch", adminRecsHandler.HandleTriggerCowatch)
+									r.Post("/trigger/recommendations", adminRecsHandler.HandleTriggerRecommendations)
+								})
+							}
+
+							if invitationService != nil {
+								adminInvitationHandler := handlers.NewAdminInvitationHandler(invitationService)
+								r.Route("/invitations", func(r chi.Router) {
+									r.Get("/", adminInvitationHandler.HandleListInvitations)
+									r.Post("/", adminInvitationHandler.HandleCreateInvitation)
+									r.Post("/{id}/resend", adminInvitationHandler.HandleResendInvitation)
+									r.Delete("/{id}", adminInvitationHandler.HandleRevokeInvitation)
+								})
+							}
+
+							if inviteCodeRepo != nil {
+								inviteCodeHandler := handlers.NewInviteCodeHandler(inviteCodeRepo)
+								r.Route("/invite-codes", func(r chi.Router) {
+									r.Get("/", inviteCodeHandler.HandleListInviteCodes)
+									r.Post("/", inviteCodeHandler.HandleCreateInviteCode)
+									r.Put("/{id}", inviteCodeHandler.HandleUpdateInviteCode)
+									r.Post("/{id}/top-up", inviteCodeHandler.HandleTopUpInviteCode)
+									r.Delete("/{id}", inviteCodeHandler.HandleDeleteInviteCode)
+								})
+							}
+
+							if adminSubtitleHandler != nil {
+								r.Route("/subtitle-providers", func(r chi.Router) {
+									r.Get("/", adminSubtitleHandler.HandleListProviders)
+									r.Route("/{provider}", func(r chi.Router) {
+										r.Put("/", adminSubtitleHandler.HandleUpdateProvider)
+										r.Post("/test", adminSubtitleHandler.HandleTestProvider)
+									})
+								})
+								r.Route("/subtitles", func(r chi.Router) {
+									r.Get("/", adminSubtitleHandler.HandleListDownloadedSubtitles)
+									r.Route("/{id}", func(r chi.Router) {
+										r.Patch("/", adminSubtitleHandler.HandlePatchDownloadedSubtitle)
+										r.Get("/download", adminSubtitleHandler.HandleDownloadDownloadedSubtitle)
+										r.Delete("/", adminSubtitleHandler.HandleDeleteDownloadedSubtitle)
+									})
+								})
+							}
+
+							// Rate limit admin routes. Mounted even when the limiter is not
+							// running (deps.RateLimitMW == nil) so admins can always reach the
+							// config; otherwise disabling rate limiting and restarting would
+							// lock the settings page out of re-enabling it.
+							if settingsRepo != nil {
+								rateLimitHandler := handlers.NewRateLimitHandler(
+									settingsRepo, deps.RateLimitMW, deps.EventBus, restartStatus, deps.RedisBootstrapAvailable,
+								)
+								r.Route("/rate-limits", func(r chi.Router) {
+									r.Get("/config", rateLimitHandler.HandleGetConfig)
+									r.Put("/config", rateLimitHandler.HandleUpdateConfig)
+								})
+							}
+
+							if apiKeyRepo != nil {
+								apiKeyHandler := handlers.NewAPIKeyHandler(apiKeyRepo)
+								r.Get("/users/{userId}/api-keys", apiKeyHandler.HandleAdminListUserAPIKeys)
+								r.Get("/api-keys", apiKeyHandler.HandleAdminListAllAPIKeys)
+								r.Post("/api-keys", apiKeyHandler.HandleAdminCreateAPIKey)
+								r.Delete("/api-keys/{id}", apiKeyHandler.HandleAdminDeleteAPIKey)
+								r.Put("/api-keys/{id}/tier", apiKeyHandler.HandleAdminUpdateTier)
+							}
+
+							if requestHandler != nil {
+								r.Get("/requests", requestHandler.HandleAdminList)
+								r.Post("/requests/{id}/approve", requestHandler.HandleApprove)
+								r.Post("/requests/{id}/decline", requestHandler.HandleDecline)
+								r.Post("/requests/{id}/cancel", requestHandler.HandleCancel)
+								r.Post("/requests/{id}/retry", requestHandler.HandleRetry)
+								r.Get("/request-settings", requestHandler.HandleGetSettings)
+								r.Put("/request-settings", requestHandler.HandleUpdateSettings)
+								r.Get("/request-users/{user_id}/limit", requestHandler.HandleGetUserLimit)
+								r.Put("/request-users/{user_id}/limit", requestHandler.HandleUpdateUserLimit)
+								r.Get("/request-integrations", requestHandler.HandleListIntegrations)
+								r.Post("/request-integrations", requestHandler.HandleCreateIntegration)
+								r.Put("/request-integrations/{id}", requestHandler.HandleUpdateIntegration)
+								r.Delete("/request-integrations/{id}", requestHandler.HandleDeleteIntegration)
+								r.Post("/request-integrations/{id}/options", requestHandler.HandleLoadIntegrationOptions)
+							}
+
+							if autoscanHandler != nil {
+								r.Get("/autoscan/settings", autoscanHandler.HandleGetSettings)
+								r.Put("/autoscan/settings", autoscanHandler.HandleUpdateSettings)
+								r.Get("/autoscan/connections", autoscanHandler.HandleListConnections)
+								r.Post("/autoscan/connections", autoscanHandler.HandleCreateConnection)
+								r.Put("/autoscan/connections/{id}", autoscanHandler.HandleUpdateConnection)
+								r.Delete("/autoscan/connections/{id}", autoscanHandler.HandleDeleteConnection)
+								r.Post("/autoscan/connections/test", autoscanHandler.HandleTestConnection)
+								r.Get("/autoscan/scan-source-plugins", autoscanHandler.HandleListAvailableScanSources)
+								r.Get("/autoscan/sources", autoscanHandler.HandleListSources)
+								r.Post("/autoscan/sources", autoscanHandler.HandleCreateSource)
+								r.Put("/autoscan/sources/{id}", autoscanHandler.HandleUpdateSource)
+								r.Delete("/autoscan/sources/{id}", autoscanHandler.HandleDeleteSource)
+								r.Get("/autoscan/sources/{id}/rewrite-suggestions", autoscanHandler.HandleRewriteSuggestions)
+								r.Post("/autoscan/sources/{id}/webhook", autoscanHandler.HandleCreateSourceWebhook)
+								r.Post("/autoscan/sources/{id}/webhook/rotate", autoscanHandler.HandleRotateSourceWebhook)
+								r.Delete("/autoscan/sources/{id}/webhook", autoscanHandler.HandleDeleteSourceWebhook)
+								r.Get("/autoscan/scans", autoscanHandler.HandleListScans)
+								r.Get("/autoscan/events", autoscanHandler.HandleListEvents)
+								r.Post("/autoscan/trigger", autoscanHandler.HandleTrigger)
+								r.Get("/autoscan/status", autoscanHandler.HandleStatus)
+							}
+
+							if deps.ActivityLogRepo != nil {
+								adminIPHandler := handlers.NewAdminIPHandler(deps.ActivityLogRepo)
+								r.Get("/users/{id}/ips", adminIPHandler.HandleGetUserIPs)
+								r.Get("/ips", adminIPHandler.HandleGetIPUsers)
+							}
+							if deps.OpsLogRepo != nil && deps.ActivityLogRepo != nil {
+								adminLogsHandler := handlers.NewAdminLogsHandler(deps.OpsLogRepo, deps.ActivityLogRepo, deps.LogStreamHub)
+								r.Get("/logs/app", adminLogsHandler.HandleListOperationalLogs)
+								r.Get("/logs/audit", adminLogsHandler.HandleListAuditLogs)
+								r.Get("/logs/ws", adminLogsHandler.HandleLogStreamWebSocket)
+							}
+							if diagnosticsHandler != nil {
+								handlers.RegisterAdminDiagnosticsRoutes(r, diagnosticsHandler)
+							}
+							if adminPlaybackControlHandler != nil {
+								r.Post("/sessions/{session_id}/pause", adminPlaybackControlHandler.HandlePauseSession)
+								r.Post("/sessions/{session_id}/resume", adminPlaybackControlHandler.HandleResumeSession)
+								r.Post("/sessions/{session_id}/stop", adminPlaybackControlHandler.HandleStopSession)
+								r.Post("/sessions/{session_id}/terminate", adminPlaybackControlHandler.HandleTerminateSession)
+								r.Post("/sessions/{session_id}/message", adminPlaybackControlHandler.HandleMessageSession)
+							}
+
+							if deps.TaskManager != nil {
+								taskHistoryRepo := repository.NewPgExecutionRepository(deps.DB)
+								taskMetrics := handlers.NewTaskMetricsService(metadata.NewRefreshDebtRepository(deps.DB))
+								taskHandler := handlers.NewTaskHandler(deps.TaskManager, taskHistoryRepo, taskMetrics)
+								r.Route("/tasks", func(r chi.Router) {
+									r.Get("/", taskHandler.HandleListTasks)
+									r.Get("/{key}", taskHandler.HandleGetTask)
+									r.Get("/{key}/metrics", taskHandler.HandleGetMetrics)
+									r.Post("/{key}/run", taskHandler.HandleRunTask)
+									r.Post("/{key}/cancel", taskHandler.HandleCancelTask)
+									r.Put("/{key}/triggers", taskHandler.HandleUpdateTriggers)
+									r.Get("/{key}/history", taskHandler.HandleGetHistory)
+								})
+							}
+						})
+					})
+				}
+			})
+		}
+	})
+
+	return r
+}
+
+// optionalProfileViewerAccess preserves the established profile-less plugin
+// launch path while validating any profile a newer caller asks the launch
+// cookie to carry. A missing viewer resolver must not remove this existing v1
+// route or add a policy/store dependency for legacy callers.
+func optionalProfileViewerAccess(viewer *apimw.ViewerAccessMiddleware) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		if viewer == nil {
+			return next
+		}
+		validated := viewer.RequireViewerAccess(next)
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.TrimSpace(r.Header.Get("X-Profile-Id")) == "" {
+				next.ServeHTTP(w, r)
+				return
+			}
+			validated.ServeHTTP(w, r)
+		})
+	}
+}
+
+// pgSubtitleMediaResolver implements handlers.SubtitleMediaResolver using a direct PG query.
+type pgSubtitleMediaResolver struct {
+	pool *pgxpool.Pool
+}
+
+func (r *pgSubtitleMediaResolver) GetMediaFileWithMetadata(ctx context.Context, fileID int) (*handlers.MediaFileMetadata, error) {
+	var meta handlers.MediaFileMetadata
+	err := r.pool.QueryRow(ctx, `
+		SELECT
+			mf.id,
+			mf.file_path,
+			COALESCE(mf.file_size, 0),
+			COALESCE(mf.file_hash, ''),
+			COALESCE(mf.resolution, ''),
+			COALESCE(mf.codec_video, ''),
+			COALESCE(mf.codec_audio, ''),
+			mi.title,
+			COALESCE(mi.year, 0),
+			COALESCE(mi.imdb_id, ''),
+			COALESCE(e.season_number, 0),
+			COALESCE(e.episode_number, 0)
+		FROM media_files mf
+		JOIN media_items mi ON mi.content_id = mf.content_id
+		LEFT JOIN episodes e ON e.content_id = mf.episode_id
+		WHERE mf.id = $1
+	`, fileID).Scan(
+		&meta.FileID,
+		&meta.FilePath,
+		&meta.FileSize,
+		&meta.FileHash,
+		&meta.Resolution,
+		&meta.VideoCodec,
+		&meta.AudioCodec,
+		&meta.Title,
+		&meta.Year,
+		&meta.IMDbID,
+		&meta.Season,
+		&meta.Episode,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &meta, nil
+}
+
+func resolveOptionalPluginAccess(
+	r *http.Request,
+	jwtService *auth.JWTService,
+	sessionRepo *auth.SessionRepository,
+) (bool, bool) {
+	authenticated, admin, _, _ := resolveOptionalPluginAccessUser(r, jwtService, sessionRepo, nil, nil)
+	return authenticated, admin
+}
+
+// resolveOptionalPluginAccessUser is like resolveOptionalPluginAccess but also
+// returns the authenticated user's ID, and accepts API-key bearer tokens
+// (sa_*) when apiKeyRepo + userRepo are provided.
+func resolveOptionalPluginAccessUser(
+	r *http.Request,
+	jwtService *auth.JWTService,
+	sessionRepo *auth.SessionRepository,
+	apiKeyRepo *auth.APIKeyRepository,
+	userRepo *auth.UserRepository,
+) (bool, bool, int, string) {
+	if jwtService == nil || sessionRepo == nil {
+		return false, false, 0, ""
+	}
+
+	token := ""
+	if header := r.Header.Get("Authorization"); header != "" {
+		parts := strings.SplitN(header, " ", 2)
+		if len(parts) == 2 && strings.EqualFold(parts[0], "bearer") {
+			token = strings.TrimSpace(parts[1])
+		}
+	}
+	if token == "" {
+		token = strings.TrimSpace(r.URL.Query().Get("token"))
+	}
+	if token == "" {
+		if cookie, err := r.Cookie(auth.PluginAccessCookieName); err == nil {
+			token = strings.TrimSpace(cookie.Value)
+		}
+	}
+	if token == "" {
+		return false, false, 0, ""
+	}
+
+	if strings.HasPrefix(token, "sa_") {
+		if apiKeyRepo == nil || userRepo == nil {
+			return false, false, 0, ""
+		}
+		apiKey, err := apiKeyRepo.GetByKey(r.Context(), token)
+		if err != nil {
+			return false, false, 0, ""
+		}
+		user, err := userRepo.GetByID(r.Context(), apiKey.UserID)
+		if err != nil || !user.Enabled {
+			return false, false, 0, ""
+		}
+		return true, user.Role == "admin", user.ID, ""
+	}
+
+	claims, err := jwtService.ValidateToken(token)
+	if err != nil || (claims.TokenType != auth.TokenTypeAccess && claims.TokenType != auth.TokenTypePluginAccess) {
+		return false, false, 0, ""
+	}
+	valid, err := sessionRepo.IsValid(r.Context(), claims.SessionID)
+	if err != nil || !valid {
+		return false, false, 0, ""
+	}
+	return true, claims.Role == "admin", claims.UserID, claims.ProfileID
+}
+
+// NewTMDBCollectionFetcher creates a TMDBCollectionFetcher from an API key.
+// Exported so main.go can construct it for the collection sync scheduler.
+func NewTMDBCollectionFetcher(apiKey string) catalog.TMDBCollectionFetcher {
+	return &tmdbCollectionAdapter{
+		client: tmdb.NewClient(apiKey, 40),
+	}
+}
+
+// tmdbCollectionAdapter adapts the tmdb.Client to the catalog.TMDBCollectionFetcher interface.
+type tmdbCollectionAdapter struct {
+	client *tmdb.Client
+}
+
+func (a *tmdbCollectionAdapter) GetCollectionPreset(ctx context.Context, preset, mediaType, timeWindow string, limit int) ([]catalog.TMDBCollectionEntry, error) {
+	results, err := a.client.GetCollectionPreset(ctx, preset, mediaType, timeWindow, limit)
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]catalog.TMDBCollectionEntry, len(results))
+	for i, r := range results {
+		entry := catalog.TMDBCollectionEntry{
+			ID:        r.ID,
+			MediaType: r.MediaType,
+			Title:     r.Title,
+		}
+
+		// Fetch external IDs (IMDb, TVDB) for better matching against local library.
+		if externalIDs, err := a.client.GetExternalIDs(ctx, r.MediaType, r.ID); err == nil && externalIDs != nil {
+			entry.IMDbID = externalIDs.IMDbID
+			entry.TVDBID = externalIDs.TVDBID
+		}
+
+		entries[i] = entry
+	}
+	return entries, nil
+}
+
+// tmdbFranchiseAdapter adapts tmdb.Client to catalog.TMDBCollectionByIDFetcher
+// for the `tmdb_collection` sync mode. Like the preset adapter, it enriches
+// each TMDB collection part with external IDs so the catalog matcher can fall
+// back to IMDb/TVDB when a local item lacks a TMDB ID.
+type tmdbFranchiseAdapter struct {
+	client *tmdb.Client
+}
+
+func (a *tmdbFranchiseAdapter) GetCollection(ctx context.Context, id int) ([]catalog.TMDBCollectionEntry, error) {
+	collection, err := a.client.GetCollection(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if collection == nil {
+		return nil, nil
+	}
+	entries := make([]catalog.TMDBCollectionEntry, len(collection.Parts))
+	for i, p := range collection.Parts {
+		mediaType := p.MediaType
+		if mediaType == "" {
+			mediaType = "movie"
+		}
+		entry := catalog.TMDBCollectionEntry{
+			ID:        p.ID,
+			MediaType: mediaType,
+			Title:     p.Title,
+		}
+		if externalIDs, err := a.client.GetExternalIDs(ctx, mediaType, p.ID); err == nil && externalIDs != nil {
+			entry.IMDbID = externalIDs.IMDbID
+			entry.TVDBID = externalIDs.TVDBID
+		}
+		entries[i] = entry
+	}
+	return entries, nil
+}
+
+// tmdbDiscoverAdapter adapts tmdb.Client to catalog.TMDBDiscoverFetcher for
+// the `tmdb_discover` sync mode. Like the preset adapter, it enriches each
+// result with external IDs so the catalog matcher can fall back to IMDb/TVDB
+// when a local item lacks a TMDB ID.
+type tmdbDiscoverAdapter struct {
+	client *tmdb.Client
+}
+
+func (a *tmdbDiscoverAdapter) Discover(ctx context.Context, mediaType string, params catalog.TMDBDiscoverParams, limit int) ([]catalog.TMDBCollectionEntry, error) {
+	results, err := a.client.Discover(ctx, mediaType, tmdb.DiscoverParams{
+		WithGenres:       params.WithGenres,
+		WithoutGenres:    params.WithoutGenres,
+		SortBy:           params.SortBy,
+		VoteCountGte:     params.VoteCountGte,
+		VoteAverageGte:   params.VoteAverageGte,
+		ReleaseDateGte:   params.ReleaseDateGte,
+		ReleaseDateLte:   params.ReleaseDateLte,
+		Certifications:   params.Certifications,
+		CertificationLte: params.CertificationLte,
+		WithRuntimeGte:   params.WithRuntimeGte,
+		WithRuntimeLte:   params.WithRuntimeLte,
+		OriginalLanguage: params.OriginalLanguage,
+		Limit:            limit,
+	})
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]catalog.TMDBCollectionEntry, len(results))
+	for i, r := range results {
+		entry := catalog.TMDBCollectionEntry{
+			ID:        r.ID,
+			MediaType: r.MediaType,
+			Title:     r.Title,
+		}
+		if externalIDs, err := a.client.GetExternalIDs(ctx, r.MediaType, r.ID); err == nil && externalIDs != nil {
+			entry.IMDbID = externalIDs.IMDbID
+			entry.TVDBID = externalIDs.TVDBID
+		}
+		entries[i] = entry
+	}
+	return entries, nil
+}
+
+type traktCollectionAdapter struct {
+	client *metatrakt.Client
+}
+
+func (a *traktCollectionAdapter) GetCollectionPreset(ctx context.Context, preset, mediaType string, limit int, accessToken string) ([]catalog.TraktCollectionEntry, error) {
+	results, err := a.client.GetCollectionPreset(ctx, preset, mediaType, limit, accessToken)
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]catalog.TraktCollectionEntry, len(results))
+	for i, r := range results {
+		entries[i] = catalog.TraktCollectionEntry{
+			TraktID:   r.TraktID,
+			TMDBID:    r.TMDBID,
+			TVDBID:    r.TVDBID,
+			IMDbID:    r.IMDbID,
+			MediaType: r.MediaType,
+			Title:     r.Title,
+			Year:      r.Year,
+			Rank:      r.Rank,
+		}
+	}
+	return entries, nil
+}
+
+func (a *traktCollectionAdapter) GetUserList(ctx context.Context, user, list string, limit int, accessToken string) ([]catalog.TraktCollectionEntry, error) {
+	results, err := a.client.GetUserList(ctx, user, list, limit, accessToken)
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]catalog.TraktCollectionEntry, len(results))
+	for i, r := range results {
+		entries[i] = catalog.TraktCollectionEntry{
+			TraktID:   r.TraktID,
+			TMDBID:    r.TMDBID,
+			TVDBID:    r.TVDBID,
+			IMDbID:    r.IMDbID,
+			MediaType: r.MediaType,
+			Title:     r.Title,
+			Year:      r.Year,
+			Rank:      r.Rank,
+		}
+	}
+	return entries, nil
+}
+
+// llmConfigFromServer derives the shared AI client config from the server
+// config. Used at construction and again on every config reload.
+func llmConfigFromServer(cfg *config.Config) llm.Config {
+	return llm.Config{
+		BaseURL:    cfg.AI.BaseURL,
+		APIKey:     cfg.AI.APIKey,
+		ChatModel:  cfg.AI.ChatModel,
+		ASRBaseURL: cfg.AI.ASRBaseURL,
+		ASRAPIKey:  cfg.AI.ASRAPIKey,
+		ASRModel:   cfg.AI.ASRModel,
+	}
+}
+
+// effectiveSubtitleAIConfig derives the subtitle AI service config from the
+// server config. A chat-only gateway (e.g. OpenRouter) cannot produce
+// timestamped transcriptions, so transcription is disabled rather than
+// letting every job fail; the settings API rejects such values for the ASR
+// URL, but the chat base URL legitimately may be one — this catches the
+// blank-ASR-URL fallback case. The second return is the offending endpoint
+// when that guard fired, empty otherwise.
+func effectiveSubtitleAIConfig(cfg *config.Config) (subtitleai.Config, string) {
+	transcribeEnabled := cfg.SubtitleAI.TranscribeEnabled
+	effectiveASRBase := cfg.AI.ASRBaseURL
+	if effectiveASRBase == "" {
+		effectiveASRBase = cfg.AI.BaseURL
+	}
+	disabledGateway := ""
+	if transcribeEnabled && llm.IsChatOnlyGateway(effectiveASRBase) {
+		transcribeEnabled = false
+		disabledGateway = effectiveASRBase
+	}
+	return subtitleai.Config{
+		Configured:            cfg.AI.BaseURL != "",
+		TranslateEnabled:      cfg.SubtitleAI.Enabled,
+		TranscribeEnabled:     transcribeEnabled,
+		ChatModel:             cfg.AI.ChatModel,
+		ASRModel:              cfg.AI.ASRModel,
+		BatchSize:             cfg.SubtitleAI.BatchSize,
+		ContextNeighbors:      cfg.SubtitleAI.ContextNeighbors,
+		LiveASRChunkSeconds:   cfg.SubtitleAI.LiveASRChunkSeconds,
+		TranscribeQuotaJobs:   cfg.SubtitleAI.TranscribeQuotaJobs,
+		TranscribeQuotaPeriod: cfg.SubtitleAI.TranscribeQuotaPeriod,
+	}, disabledGateway
+}
+
+func warnChatOnlyGateway(endpoint string) {
+	slog.Warn("subtitle transcription disabled: the effective transcription endpoint is a chat-only gateway; "+
+		"set a Whisper-compatible Transcription base URL in AI Services", "endpoint", endpoint)
+}
+
+type scopeEntitlementResolver struct {
+	resolver apimw.ViewerResolver
+}
+
+func (r scopeEntitlementResolver) MaxPlaybackQuality(ctx context.Context, userID int, profileID string) (string, error) {
+	scope, err := r.resolveScope(ctx, userID, profileID)
+	if err != nil {
+		return "", err
+	}
+	return scope.MaxPlaybackQuality, nil
+}
+
+// MaxContentRating implements mediarequests.ContentRatingResolver so request
+// discovery honors the profile's parental rating ceiling.
+func (r scopeEntitlementResolver) MaxContentRating(ctx context.Context, userID int, profileID string) (string, error) {
+	scope, err := r.resolveScope(ctx, userID, profileID)
+	if err != nil {
+		return "", err
+	}
+	return scope.MaxContentRating, nil
+}
+
+func (r scopeEntitlementResolver) resolveScope(ctx context.Context, userID int, profileID string) (access.Scope, error) {
+	return r.resolver.Resolve(ctx, access.ResolveInput{
+		UserID:              userID,
+		ProfileID:           profileID,
+		SkipPINVerification: true,
+	})
+}
+
+// metadataAIConfigFromServer derives the metadata translation service config
+// from the server config. Used at construction and on every config reload.
+func metadataAIConfigFromServer(cfg *config.Config) metadatatranslation.Config {
+	return metadatatranslation.Config{
+		Enabled:    cfg.MetadataAI.Enabled,
+		Configured: cfg.AI.BaseURL != "",
+		ChatModel:  cfg.AI.ChatModel,
+		OnView:     cfg.MetadataAI.OnView,
+	}
+}

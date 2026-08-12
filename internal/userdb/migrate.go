@@ -1,0 +1,486 @@
+package userdb
+
+import (
+	"database/sql"
+	"fmt"
+)
+
+const schemaVersion = 18
+
+func runMigrations(db *sql.DB) error {
+	version, err := userVersion(db)
+	if err != nil {
+		return err
+	}
+	if version > schemaVersion {
+		return fmt.Errorf("unsupported sqlite schema version %d", version)
+	}
+	if version == 0 {
+		return setUserVersion(db, schemaVersion)
+	}
+	if version == schemaVersion {
+		return nil
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("beginning sqlite migration transaction: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	if version < 2 {
+		if err := migrateToV2(tx); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("PRAGMA user_version = 2"); err != nil {
+			return fmt.Errorf("setting sqlite user_version 2: %w", err)
+		}
+	}
+
+	if version < 3 {
+		if err := migrateToV3(tx); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("PRAGMA user_version = 3"); err != nil {
+			return fmt.Errorf("setting sqlite user_version 3: %w", err)
+		}
+	}
+
+	if version < 4 {
+		if err := migrateToV4(tx); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("PRAGMA user_version = 4"); err != nil {
+			return fmt.Errorf("setting sqlite user_version 4: %w", err)
+		}
+	}
+
+	if version < 5 {
+		if err := migrateToV5(tx); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("PRAGMA user_version = 5"); err != nil {
+			return fmt.Errorf("setting sqlite user_version 5: %w", err)
+		}
+	}
+
+	if version < 6 {
+		if err := migrateToV6(tx); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("PRAGMA user_version = 6"); err != nil {
+			return fmt.Errorf("setting sqlite user_version 6: %w", err)
+		}
+	}
+
+	if version < 7 {
+		if err := migrateToV7(tx); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("PRAGMA user_version = 7"); err != nil {
+			return fmt.Errorf("setting sqlite user_version 7: %w", err)
+		}
+	}
+
+	if version < 8 {
+		if err := migrateToV8(tx); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("PRAGMA user_version = 8"); err != nil {
+			return fmt.Errorf("setting sqlite user_version 8: %w", err)
+		}
+	}
+
+	if version < 9 {
+		if _, err := tx.Exec("PRAGMA user_version = 9"); err != nil {
+			return fmt.Errorf("setting sqlite user_version 9: %w", err)
+		}
+	}
+
+	if version < 10 {
+		if err := migrateToV10(tx); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("PRAGMA user_version = 10"); err != nil {
+			return fmt.Errorf("setting sqlite user_version 10: %w", err)
+		}
+	}
+
+	if version < 11 {
+		if err := migrateToV11(tx); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("PRAGMA user_version = 11"); err != nil {
+			return fmt.Errorf("setting sqlite user_version 11: %w", err)
+		}
+	}
+
+	if version < 12 {
+		if err := migrateToV12(tx); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("PRAGMA user_version = 12"); err != nil {
+			return fmt.Errorf("setting sqlite user_version 12: %w", err)
+		}
+	}
+
+	if version < 13 {
+		if err := migrateToV13(tx); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("PRAGMA user_version = 13"); err != nil {
+			return fmt.Errorf("setting sqlite user_version 13: %w", err)
+		}
+	}
+
+	if version < 14 {
+		if err := migrateToV14(tx); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("PRAGMA user_version = 14"); err != nil {
+			return fmt.Errorf("setting sqlite user_version 14: %w", err)
+		}
+	}
+
+	if version < 15 {
+		if err := migrateToV15(tx); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("PRAGMA user_version = 15"); err != nil {
+			return fmt.Errorf("setting sqlite user_version 15: %w", err)
+		}
+	}
+
+	if version < 16 {
+		if err := migrateToV16(tx); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("PRAGMA user_version = 16"); err != nil {
+			return fmt.Errorf("setting sqlite user_version 16: %w", err)
+		}
+	}
+
+	if version < 17 {
+		if err := migrateToV17(tx); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("PRAGMA user_version = 17"); err != nil {
+			return fmt.Errorf("setting sqlite user_version 17: %w", err)
+		}
+	}
+
+	if version < 18 {
+		if err := migrateToV18(tx); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("PRAGMA user_version = 18"); err != nil {
+			return fmt.Errorf("setting sqlite user_version 18: %w", err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+// migrateToV18 seeds the family-neutral navigation shortcut catalog from the
+// existing web sidebar pins. InitSchema has already rebuilt
+// user_setting_values with the profile_client identity before this versioned
+// migration runs; keeping the data conversion here makes it one-time and
+// transactional with the schema-version bump.
+func migrateToV18(tx *sql.Tx) error {
+	return migrateSidebarPinsToNavigationShortcuts(tx)
+}
+
+// migrateToV17 rehomes the Jellyfin DisplayPreferences blobs from
+// user_settings (jellycompat:* keys) into the dedicated
+// jellycompat_displayprefs table, removing the last non-settings tenant of the
+// legacy key/value table. The table itself comes from InitSchema on this open;
+// executing the DDL again here records it for the version gate, the same shape
+// migrateToV15 used for the settings contract tables.
+func migrateToV17(tx *sql.Tx) error {
+	if _, err := tx.Exec(jellycompatDisplayPrefsSchema); err != nil {
+		return fmt.Errorf("creating jellycompat_displayprefs: %w", err)
+	}
+	return moveJellycompatDisplayPrefs(tx)
+}
+
+// migrateToV16 backfills canonical setting values from the legacy tables.
+//
+// V15 created the tables; this fills them. It is the cutover's data half, and
+// it runs in the same transaction as every other step, so a database either
+// comes out fully migrated or untouched.
+func migrateToV16(tx *sql.Tx) error {
+	return migrateSettingsToCanonical(tx)
+}
+
+// migrateToV15 adds the canonical settings contract tables. InitSchema already
+// creates them with IF NOT EXISTS on every open, so this step is what records
+// that an existing database has them — the same shape migrateToV6 used for
+// series_playback_preferences.
+//
+// The settings-contract steps were numbered V14-V16 while this branch was in
+// review; main's profile_onboarding migration took V14 first, so they shifted
+// to V15-V17. Only unreleased dev databases carried the old numbers, and every
+// step is idempotent, so a re-run under the new numbering is harmless.
+func migrateToV15(tx *sql.Tx) error {
+	if _, err := tx.Exec(settingContractSchema); err != nil {
+		return fmt.Errorf("creating settings contract tables: %w", err)
+	}
+	return nil
+}
+
+// migrateToV14 adds the per-profile onboarding-tour state table. Keyed by
+// (profile_id, tour_id): finishing or skipping the tour on one device is
+// respected everywhere, and a future materially-different tour can use a new
+// tour_id without clobbering history.
+func migrateToV14(tx *sql.Tx) error {
+	_, err := tx.Exec(`CREATE TABLE IF NOT EXISTS profile_onboarding (
+		profile_id TEXT NOT NULL,
+		tour_id TEXT NOT NULL,
+		last_step TEXT NOT NULL DEFAULT '',
+		completed_at TEXT,
+		skipped_at TEXT,
+		updated_at TEXT NOT NULL,
+		PRIMARY KEY (profile_id, tour_id)
+	)`)
+	if err != nil {
+		return fmt.Errorf("creating profile_onboarding: %w", err)
+	}
+	return nil
+}
+
+// migrateToV13 replaces the v1 watch_progress stamp triggers with the current
+// bodies (CREATE TRIGGER IF NOT EXISTS never replaces an existing trigger, and
+// InitSchema runs before migrations, so this must drop AND recreate). v2 makes
+// the UPDATE trigger authoritative for event_at: a write that advances
+// updated_at without explicitly changing event_at advances the LWW key too,
+// so queued offline events older than that write can no longer win
+// SetProgressIfNewer and resurrect stale progress.
+func migrateToV13(tx *sql.Tx) error {
+	for _, trg := range []string{"watch_progress_stamp_ins", "watch_progress_stamp_upd"} {
+		if _, err := tx.Exec("DROP TRIGGER IF EXISTS " + trg); err != nil {
+			return fmt.Errorf("dropping %s: %w", trg, err)
+		}
+	}
+	if _, err := tx.Exec(watchProgressSyncTriggers); err != nil {
+		return fmt.Errorf("reinstalling watch_progress sync triggers: %w", err)
+	}
+	return nil
+}
+
+// migrateToV12 adds the nullable watchlist.sort_index column used to mirror a
+// provider's watchlist order. NULL means "use added_at ordering".
+func migrateToV12(tx *sql.Tx) error {
+	if columnExists(tx, "watchlist", "sort_index") {
+		return nil
+	}
+	if _, err := tx.Exec("ALTER TABLE watchlist ADD COLUMN sort_index INTEGER"); err != nil {
+		return fmt.Errorf("adding watchlist.sort_index: %w", err)
+	}
+	return nil
+}
+
+// migrateToV11 resets legacy completed watch_progress rows to
+// position_seconds = 0. The watch-progress model keeps `completed` as a
+// one-way watched latch with no resume point; the Continue Watching
+// predicate is position_seconds > 0, so legacy rows (position pinned to the
+// duration) would otherwise surface as phantom resume entries. Running this
+// as a versioned migration (rather than a predicate-only data fix) matters:
+// re-running the UPDATE on every boot would wipe the resume point of any
+// rewatch in flight.
+func migrateToV11(tx *sql.Tx) error {
+	if _, err := tx.Exec(`
+		UPDATE watch_progress
+		SET position_seconds = 0
+		WHERE completed = 1
+		  AND position_seconds <> 0`); err != nil {
+		return fmt.Errorf("resetting completed watch_progress positions: %w", err)
+	}
+	return nil
+}
+
+func migrateToV10(tx *sql.Tx) error {
+	if columnExists(tx, "watch_history", "watch_identity") {
+		return nil
+	}
+	if _, err := tx.Exec("ALTER TABLE watch_history ADD COLUMN watch_identity TEXT NOT NULL DEFAULT '{}'"); err != nil {
+		return fmt.Errorf("adding watch_history.watch_identity: %w", err)
+	}
+	return nil
+}
+
+func userVersion(db *sql.DB) (int, error) {
+	var version int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		return 0, fmt.Errorf("querying sqlite user_version: %w", err)
+	}
+	return version, nil
+}
+
+func setUserVersion(db *sql.DB, version int) error {
+	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", version)); err != nil {
+		return fmt.Errorf("setting sqlite user_version %d: %w", version, err)
+	}
+	return nil
+}
+
+func migrateToV3(tx *sql.Tx) error {
+	cols := []struct{ name, ddl string }{
+		{"last_file_id", "ALTER TABLE watch_progress ADD COLUMN last_file_id INTEGER"},
+		{"last_resolution", "ALTER TABLE watch_progress ADD COLUMN last_resolution TEXT"},
+		{"last_hdr", "ALTER TABLE watch_progress ADD COLUMN last_hdr BOOLEAN"},
+		{"last_codec_video", "ALTER TABLE watch_progress ADD COLUMN last_codec_video TEXT"},
+	}
+	for _, c := range cols {
+		if columnExists(tx, "watch_progress", c.name) {
+			continue
+		}
+		if _, err := tx.Exec(c.ddl); err != nil {
+			return fmt.Errorf("adding watch_progress.%s: %w", c.name, err)
+		}
+	}
+	return nil
+}
+
+func migrateToV8(tx *sql.Tx) error {
+	if columnExists(tx, "watch_progress", "last_edition_key") {
+		return nil
+	}
+	if _, err := tx.Exec("ALTER TABLE watch_progress ADD COLUMN last_edition_key TEXT"); err != nil {
+		return fmt.Errorf("adding watch_progress.last_edition_key: %w", err)
+	}
+	return nil
+}
+
+func columnExists(tx *sql.Tx, table, column string) bool {
+	var count int
+	err := tx.QueryRow("SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?", table, column).Scan(&count)
+	return err == nil && count > 0
+}
+
+func migrateToV2(tx *sql.Tx) error {
+	if _, err := tx.Exec("ALTER TABLE profiles ADD COLUMN library_restrictions_enabled BOOLEAN DEFAULT false"); err != nil {
+		return fmt.Errorf("adding profiles.library_restrictions_enabled: %w", err)
+	}
+	if _, err := tx.Exec("ALTER TABLE profiles ADD COLUMN max_playback_quality TEXT DEFAULT ''"); err != nil {
+		return fmt.Errorf("adding profiles.max_playback_quality: %w", err)
+	}
+	if _, err := tx.Exec(`
+		CREATE TABLE IF NOT EXISTS profile_allowed_libraries (
+			profile_id TEXT NOT NULL,
+			library_id INTEGER NOT NULL,
+			PRIMARY KEY (profile_id, library_id)
+		)`); err != nil {
+		return fmt.Errorf("creating profile_allowed_libraries: %w", err)
+	}
+	if _, err := tx.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_profile_allowed_libraries_lookup
+		ON profile_allowed_libraries(profile_id)`); err != nil {
+		return fmt.Errorf("creating idx_profile_allowed_libraries_lookup: %w", err)
+	}
+	return nil
+}
+
+func migrateToV4(tx *sql.Tx) error {
+	cols := []struct{ name, ddl string }{
+		{"creator_profile_id", "ALTER TABLE personal_collections ADD COLUMN creator_profile_id TEXT NOT NULL DEFAULT ''"},
+		{"collection_type", "ALTER TABLE personal_collections ADD COLUMN collection_type TEXT NOT NULL DEFAULT 'manual'"},
+		{"is_shared", "ALTER TABLE personal_collections ADD COLUMN is_shared BOOLEAN DEFAULT false"},
+		{"query_definition", "ALTER TABLE personal_collections ADD COLUMN query_definition TEXT NOT NULL DEFAULT '{}'"},
+		{"sort_config", "ALTER TABLE personal_collections ADD COLUMN sort_config TEXT NOT NULL DEFAULT '{}'"},
+	}
+	for _, c := range cols {
+		if columnExists(tx, "personal_collections", c.name) {
+			continue
+		}
+		if _, err := tx.Exec(c.ddl); err != nil {
+			return fmt.Errorf("adding personal_collections.%s: %w", c.name, err)
+		}
+	}
+
+	if _, err := tx.Exec(`
+		UPDATE personal_collections
+		SET creator_profile_id = profile_id
+		WHERE creator_profile_id = ''
+	`); err != nil {
+		return fmt.Errorf("backfilling creator_profile_id: %w", err)
+	}
+
+	if _, err := tx.Exec(`
+		CREATE TABLE IF NOT EXISTS personal_collection_profiles (
+			collection_id TEXT NOT NULL,
+			profile_id TEXT NOT NULL,
+			PRIMARY KEY (collection_id, profile_id)
+		)`); err != nil {
+		return fmt.Errorf("creating personal_collection_profiles: %w", err)
+	}
+	if _, err := tx.Exec(`
+		INSERT OR IGNORE INTO personal_collection_profiles (collection_id, profile_id)
+		SELECT id, profile_id
+		FROM personal_collections
+	`); err != nil {
+		return fmt.Errorf("backfilling personal_collection_profiles: %w", err)
+	}
+	if _, err := tx.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_personal_collection_profiles_lookup
+		ON personal_collection_profiles(profile_id, collection_id)`); err != nil {
+		return fmt.Errorf("creating idx_personal_collection_profiles_lookup: %w", err)
+	}
+	return nil
+}
+
+func migrateToV5(tx *sql.Tx) error {
+	// Rename collection_mode → collection_type. SQLite ALTER TABLE RENAME COLUMN
+	// is supported in SQLite ≥ 3.25.0.
+	if columnExists(tx, "personal_collections", "collection_mode") {
+		if _, err := tx.Exec("ALTER TABLE personal_collections RENAME COLUMN collection_mode TO collection_type"); err != nil {
+			return fmt.Errorf("renaming personal_collections.collection_mode → collection_type: %w", err)
+		}
+	}
+	return nil
+}
+
+func migrateToV6(tx *sql.Tx) error {
+	if _, err := tx.Exec(`
+		CREATE TABLE IF NOT EXISTS series_playback_preferences (
+			profile_id TEXT NOT NULL,
+			series_id TEXT NOT NULL,
+			resolution TEXT,
+			hdr BOOLEAN NOT NULL DEFAULT false,
+			codec_video TEXT,
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY (profile_id, series_id)
+		)`); err != nil {
+		return fmt.Errorf("creating series_playback_preferences: %w", err)
+	}
+	return nil
+}
+
+func migrateToV7(tx *sql.Tx) error {
+	cols := []struct {
+		table string
+		name  string
+		ddl   string
+	}{
+		{
+			table: "audio_preferences",
+			name:  "audio_track_signature",
+			ddl:   "ALTER TABLE audio_preferences ADD COLUMN audio_track_signature TEXT NOT NULL DEFAULT '{}'",
+		},
+		{
+			table: "subtitle_preferences",
+			name:  "subtitle_track_signature",
+			ddl:   "ALTER TABLE subtitle_preferences ADD COLUMN subtitle_track_signature TEXT NOT NULL DEFAULT '{}'",
+		},
+	}
+
+	for _, c := range cols {
+		if columnExists(tx, c.table, c.name) {
+			continue
+		}
+		if _, err := tx.Exec(c.ddl); err != nil {
+			return fmt.Errorf("adding %s.%s: %w", c.table, c.name, err)
+		}
+	}
+
+	return nil
+}

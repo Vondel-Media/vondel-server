@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Vondel mark</title>
+  <desc id="desc">A warm red V shaped like two converging beams on a midnight blue field.</desc>
+  <rect width="1024" height="1024" rx="224" fill="#101827"/>
+  <path d="M184 230h176l152 414 152-414h176L591 816H433L184 230Z" fill="#F05A47"/>
+  <path d="m512 644 79 172H433l79-172Z" fill="#F7E7D4" fill-opacity=".16"/>
+</svg>
