@@ -27,6 +27,65 @@ permissions:
   contents: read
 
 jobs:
+  client-contracts:
+    name: Client contracts (Vondel required; official compatibility verdict)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: vondel_contract
+          POSTGRES_PASSWORD: invented-ci-password
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U vondel_contract -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - name: Checkout server
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout private client contracts
+        uses: actions/checkout@v5
+        with:
+          repository: Vondel-Media/vondel-client-contracts
+          ref: f54863cc99eb3518b85e1c7006de7f8e5ce32f2d
+          path: .client-contracts
+          persist-credentials: false
+          token: ${{ secrets.CLIENT_CONTRACTS_READ_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run required Vondel disposable conformance
+        env:
+          SILO_CLIENT_CONTRACT_ADMIN_URL: postgres://vondel_contract:invented-ci-password@127.0.0.1:5432/postgres?sslmode=disable
+          VONDEL_CLIENT_CONTRACTS_DIR: ${{ github.workspace }}/.client-contracts
+        run: go test ./internal/clientcontract -run TestDisposableDatabaseMigratesSeedsRunsAndDrops -count=1 -v
+
+      - name: Run pinned official baseline and full compatibility verdict
+        env:
+          SILO_CLIENT_CONTRACT_ADMIN_URL: postgres://vondel_contract:invented-ci-password@127.0.0.1:5432/postgres?sslmode=disable
+          VONDEL_CLIENT_CONTRACTS_DIR: ${{ github.workspace }}/.client-contracts
+          VONDEL_RUN_OFFICIAL_SILO_BASELINE: "1"
+        run: go test ./internal/clientcontract -run TestOfficialSiloPinnedBaseline -count=1 -v | tee official-silo-compatibility.txt
+
+      - name: Publish pinned official compatibility evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: official-silo-compatibility
+          path: official-silo-compatibility.txt
+
   go:
     name: Go
     runs-on: ubuntu-latest

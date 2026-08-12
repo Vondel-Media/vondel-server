@@ -27,6 +27,7 @@ import (
 	"github.com/Vondel-Media/vondel-server/internal/config"
 	"github.com/Vondel-Media/vondel-server/internal/database"
 	evt "github.com/Vondel-Media/vondel-server/internal/events"
+	"github.com/Vondel-Media/vondel-server/internal/models"
 	"github.com/Vondel-Media/vondel-server/internal/playback"
 	"github.com/Vondel-Media/vondel-server/internal/scanner"
 	"github.com/Vondel-Media/vondel-server/internal/secret"
@@ -34,6 +35,8 @@ import (
 	"github.com/Vondel-Media/vondel-server/migrations"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/pressly/goose/v3"
 )
 
 const officialSiloBaselineCommit = "1dcdd4b27ab5fcd697a32fc20f20c2400ca24688"
@@ -145,6 +148,11 @@ func migrateAndSeed(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
 	if err := database.RunMigrations(migrationCtx, pool, migrations.FS, "sql"); err != nil {
 		t.Fatalf("migrate disposable database: %v", err)
 	}
+	seedInventedMedia(t, ctx, pool)
+}
+
+func seedInventedMedia(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
 	fixtures := []struct {
 		id, mediaType, title string
 	}{
@@ -169,6 +177,62 @@ ON CONFLICT (content_id) DO NOTHING`, fixture.id, fixture.mediaType, fixture.tit
 	}
 	if count != len(fixtures) {
 		t.Fatalf("invented seed count = %d, want %d", count, len(fixtures))
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO media_folders (id, type, name, enabled) VALUES (4242, 'movie', 'Invented Playback Files', true)`); err != nil {
+		t.Fatalf("seed playback media folder: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO media_item_libraries (content_id, media_folder_id) SELECT unnest($1::text[]), 4242`, []string{"4242", "8080", "313", "2718", "1618", "5772"}); err != nil {
+		t.Fatalf("seed contract library memberships: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `SELECT setval('media_files_id_seq', 4242000, true)`); err != nil {
+		t.Fatalf("reserve invented playback file id: %v", err)
+	}
+	playbackPath := filepath.Join(t.TempDir(), "the-invented-crossing.mp4")
+	if err := os.WriteFile(playbackPath, []byte("invented contract media bytes\n"), 0o600); err != nil {
+		t.Fatalf("create invented playback media: %v", err)
+	}
+	file, err := scanner.NewFileRepository(pool).Upsert(ctx, models.MediaFile{
+		ContentID: "4242", MediaFolderID: 4242, FilePath: playbackPath,
+		FileSize: 1048576, CodecVideo: "h264", CodecAudio: "aac", Resolution: "1080p",
+		AudioChannels: 2, Container: "mp4", Duration: 6480, Bitrate: 8000,
+	})
+	if err != nil {
+		t.Fatalf("seed playback media file: %v", err)
+	}
+	if file.ID != 4242001 {
+		t.Fatalf("playback media file id = %d, want 4242001", file.ID)
+	}
+}
+
+func migrateOfficialSchema(t *testing.T, ctx context.Context, pool *pgxpool.Pool, worktree string) {
+	t.Helper()
+	sqlDB := stdlib.OpenDB(*pool.Config().ConnConfig)
+	defer sqlDB.Close()
+	provider, err := goose.NewProvider(goose.DialectPostgres, sqlDB, os.DirFS(filepath.Join(worktree, "migrations", "sql")), goose.WithTableName("public.goose_db_version"), goose.WithAllowOutofOrder(true))
+	if err != nil {
+		t.Fatalf("create pinned official migration provider: %v", err)
+	}
+	defer provider.Close()
+	if _, err := provider.Up(ctx); err != nil {
+		t.Fatalf("migrate pinned official schema: %v", err)
+	}
+}
+
+func seedAccountScopedFixtures(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	var userID int
+	var profileID string
+	if err := pool.QueryRow(ctx, `SELECT u.id, p.id FROM users u JOIN user_profiles p ON p.user_id = u.id WHERE u.username = 'fixture.viewer' ORDER BY p.is_primary DESC LIMIT 1`).Scan(&userID, &profileID); err != nil {
+		t.Fatalf("resolve fixture account scope: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO user_devices (user_id, profile_id, device_id, device_name, device_platform) VALUES ($1, $2, 'fixture-device-0001', 'Invented Device', 'conformance') ON CONFLICT DO NOTHING`, userID, profileID); err != nil {
+		t.Fatalf("seed fixture device: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO downloads (id, user_id, profile_id, device_id, media_file_id, content_id, kind, status, format, quality, effective_quality, revision, file_size)
+VALUES ('fixture-download-1618', $1, $2, 'fixture-device-0001', 4242001, '1618', 'direct', 'ready', 'original', 'original', 'original', 1, 1048576)
+ON CONFLICT (id) DO NOTHING`, userID, profileID); err != nil {
+		t.Fatalf("seed offline fixture: %v", err)
 	}
 }
 
@@ -264,26 +328,51 @@ func contractsRepository(t *testing.T) string {
 
 func runContractsCLI(t *testing.T, contractsDir, baseURL string) {
 	t.Helper()
+	report := runContractsReport(t, contractsDir, baseURL)
+	if !report.Passed {
+		t.Fatal("contracts full matrix failed")
+	}
+}
+
+type contractsReport struct {
+	Passed           bool
+	OfficialBaseline bool
+	Results          []struct{ Name, Status string }
+}
+
+func runContractsReport(t *testing.T, contractsDir, baseURL string) contractsReport {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "go", "run", "./cmd/vondel-client-conformance", "-base-url", baseURL, "-fixtures", contractsDir, "-timeout", "30s")
 	cmd.Dir = contractsDir
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("contracts conformance failed: %v\n%s", err, output)
-	}
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	output := stdout.Bytes()
 	var report struct {
-		Results []struct {
+		OfficialBaselinePassed bool `json:"official_baseline_passed"`
+		Results                []struct {
 			Name   string `json:"name"`
 			Status string `json:"status"`
 		} `json:"results"`
 	}
 	if err := json.Unmarshal(output, &report); err != nil {
-		t.Fatalf("decode contracts report: %v\n%s", err, output)
+		t.Fatalf("decode contracts report: %v\nstdout:\n%s\nstderr:\n%s", err, output, stderr.String())
 	}
 	if len(report.Results) == 0 {
 		t.Fatal("contracts report contained no cases")
 	}
+	if len(report.Results) != 14 {
+		t.Fatalf("contracts report cases = %d, want 14", len(report.Results))
+	}
+	parsed := contractsReport{Passed: err == nil, OfficialBaseline: report.OfficialBaselinePassed}
+	for _, result := range report.Results {
+		parsed.Results = append(parsed.Results, struct{ Name, Status string }{result.Name, result.Status})
+	}
+	return parsed
 }
 
 func runOfficialSiloBaseline(t *testing.T, ctx context.Context, adminURL, contractsDir string) {
@@ -333,18 +422,12 @@ func runOfficialSiloBaseline(t *testing.T, ctx context.Context, adminURL, contra
 		"POSTGRES_TUNE": "off",
 		"REDIS_URL":     "",
 	})
-	// Provision through the contract harness so the official binary is tested
-	// against the same deterministic schema and invented media set as Vondel.
-	// The baseline assertion is about its public HTTP behavior, not about
-	// reproducing historical migration-runner behavior.
-	migrateAndSeed(t, ctx, db.pool)
-	var userCount int
-	if err := db.pool.QueryRow(ctx, `SELECT COUNT(*) FROM users`).Scan(&userCount); err != nil {
-		t.Fatalf("count official baseline fixture users: %v", err)
-	}
-	if userCount != 0 {
-		t.Fatalf("official baseline disposable database started with %d users, want 0", userCount)
-	}
+	migrateOfficialSchema(t, ctx, db.pool, worktree)
+	seedInventedMedia(t, ctx, db.pool)
+	provisioner := startVondelServer(t, db.pool)
+	setupFixtureAccount(t, provisioner.URL)
+	seedAccountScopedFixtures(t, ctx, db.pool)
+	provisioner.Close()
 	for _, pluginID := range []string{"silo.tmdb", "silo.tvdb"} {
 		if _, err := db.pool.Exec(ctx, `
 INSERT INTO plugin_installations (repository_id, plugin_id, version, install_path, enabled, kind, update_policy)
@@ -369,21 +452,14 @@ ON CONFLICT DO NOTHING`, pluginID); err != nil {
 	})
 	baseURL := "http://127.0.0.1:" + portText
 	waitForHealth(t, baseURL, &logs)
-	if err := db.pool.QueryRow(ctx, `SELECT COUNT(*) FROM users`).Scan(&userCount); err != nil {
-		t.Fatalf("count official baseline users after startup: %v", err)
+	report := runContractsReport(t, contractsDir, baseURL)
+	if !report.OfficialBaseline {
+		t.Fatal("pinned official authenticated baseline subset failed")
 	}
-	if userCount != 0 {
-		t.Fatalf("official baseline startup created %d users before fixture setup\n%s", userCount, logs.String())
+	if report.Passed {
+		t.Fatal("pinned official full matrix unexpectedly passed; update the recorded compatibility verdict")
 	}
-	status, responseBody := setupFixtureAccountResponse(t, baseURL)
-	if status == http.StatusUnauthorized && strings.Contains(responseBody, `"error":"setup_complete"`) {
-		t.Logf("KNOWN_UPSTREAM_GAP official Silo %s rejects initial setup on a verified empty disposable users table", officialSiloBaselineCommit)
-		return
-	}
-	if status != http.StatusCreated {
-		t.Fatalf("setup official fixture account status = %d, want %d: %s", status, http.StatusCreated, responseBody)
-	}
-	runContractsCLI(t, contractsDir, baseURL)
+	t.Logf("pinned official authenticated baseline passed; full matrix incompatibilities: %v", report.Results)
 }
 
 func environmentWithOverrides(base []string, overrides map[string]string) []string {

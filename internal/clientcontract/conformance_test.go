@@ -78,6 +78,7 @@ func TestDisposableDatabaseMigratesSeedsRunsAndDrops(t *testing.T) {
 	migrateAndSeed(t, ctx, db.pool)
 	server := startVondelServer(t, db.pool)
 	setupFixtureAccount(t, server.URL)
+	seedAccountScopedFixtures(t, ctx, db.pool)
 	runContractsCLI(t, contractsDir, server.URL)
 
 	db.cleanup(t, context.Background())
