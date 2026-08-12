@@ -869,3 +869,44 @@ git push origin main
 The next implementation plan is `vondel-plugins` plus MetaDB, TMDB, and TVDB;
 it must pin `github.com/Vondel-Media/vondel-plugin-sdk v0.13.2` and must not use a
 local replace directive.
+
+## Execution Notes
+
+The SDK remains private at
+<https://github.com/Vondel-Media/vondel-plugin-sdk>.
+
+The initially planned `v0.13.2` tag is a failed private release candidate at
+commit `71308e583a3cc1c0acaae0af48bbd11bf6b9b633`. Its Release workflow failed
+because the GitHub-hosted runner did not provide the `rg` command required by
+the fail-closed private-release guard:
+<https://github.com/Vondel-Media/vondel-plugin-sdk/actions/runs/31592408485>.
+No GitHub Release was created for `v0.13.2`, the tag was not rewritten, and it
+must not be used as a downstream dependency pin.
+
+The workflow remediation was reviewed at commit
+`50b99ea65028431e27108eb0da8db537a016d3b4`
+(`ci: provision ripgrep for release guards`). Its push-triggered CI run passed:
+<https://github.com/Vondel-Media/vondel-plugin-sdk/actions/runs/31592910249>.
+
+The verified private SDK handoff is the annotated tag `v0.13.3`, which resolves
+to the reviewed remediation commit
+`50b99ea65028431e27108eb0da8db537a016d3b4`. The exact tag-triggered Release
+workflow passed its private-release guard, Go tests, example builds, immutable
+remote-tag check, and GitHub Release creation:
+<https://github.com/Vondel-Media/vondel-plugin-sdk/actions/runs/31593214058>.
+The resulting private, non-draft, non-prerelease GitHub Release is
+<https://github.com/Vondel-Media/vondel-plugin-sdk/releases/tag/v0.13.3>.
+A fresh external module and module cache resolved
+`github.com/Vondel-Media/vondel-plugin-sdk v0.13.3` using configured private
+GitHub authentication, with no credential persisted or printed.
+
+The tagged SDK preserves the `silo.plugin.v1` protobuf package,
+`silo_api_version` manifest key and `v1` value, field number 4, plugin-set name
+`silo`, protocol version 1, `SILO_PLUGIN` / `silo-rpc-plugin-v1` handshake,
+service names including `Runtime`, `MetadataProvider`, `ScanSource`, and
+`RuntimeHost`, and capability values including `metadata_provider.v1`,
+`image_resolver.v1`, and `scan_source.v1`.
+
+The next implementation plan for `vondel-plugins` plus MetaDB, TMDB, and TVDB
+must pin `github.com/Vondel-Media/vondel-plugin-sdk v0.13.3` and must not use a
+local `replace` directive.
