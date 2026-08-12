@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build original, native Vondel clients for all Apple and Android targets with complete Watch, Listen and Read support, while retaining documented compatibility with Vondel and official Silo servers.
+**Goal:** Build original, native Vondel clients for all Apple and Android targets with complete Watch, Listen, Read and Live TV/DVR support, while retaining documented compatibility with Vondel and official Silo servers.
 
 **Architecture:** A platform-neutral contracts repository defines server schemas, invented fixtures and conformance behavior. Empty Apple and Android repositories independently implement those contracts using SwiftUI/native Apple media frameworks and Kotlin/Compose/Media3; they share no UI or application runtime. TV is the first production-complete vertical slice, but submission is blocked until the full media/platform matrix passes.
 
@@ -15,6 +15,7 @@
 - No reference source, assets, layouts, internal symbols, tests, filenames or package structure may be copied.
 - The only shared boundary is documented server contracts plus deterministic invented fixtures.
 - Support movies, episodic television, music, audiobooks, ebooks and manga on iPhone, iPad, macOS, Apple TV, Android phone, Android tablet and Android TV before store submission.
+- Support Live TV guide, tune, timeshift, one-off/series DVR, conflicts and recordings on all seven targets before store submission.
 - Implement both Vondel and capability-compatible official Silo server connections.
 - Use `media.vondel.app` application identities and `media.vondel` source namespaces.
 - Use AGPL-3.0-or-later and record every dependency/asset license.
@@ -27,8 +28,8 @@
 - Tasks 1–2 establish the mandatory provenance and contract boundary.
 - Tasks 3 and 4 run in parallel after Task 2.
 - Task 5 runs in parallel per platform after both foundations expose the same route semantics.
-- Tasks 6–9 are vertical feature slices; Apple and Android implementations run in parallel within each slice, while Watch, Listen and Read coordinators remain isolated.
-- Task 10 begins only after Tasks 6–9 are green on every target.
+- Tasks 6–10 are vertical feature slices; Apple and Android implementations run in parallel within each slice, while Watch, Listen, Read and Live TV coordinators remain isolated.
+- Task 10 depends on the Vondel Live TV server/contracts plan reaching its contract handoff; Task 11 begins only after Tasks 6–10 are green on every target.
 
 ---
 
@@ -211,7 +212,25 @@ func testProfileSwitchRejectsPreviousScopeResult() async throws {
 - [ ] Run airplane-mode, process-death, token-expiry, server-switch, profile-switch, disk-pressure and corrupted-bundle suites.
 - [ ] Commit/push both cross-media slices and require exact-head CI green.
 
-### Task 10: Full Matrix, Privacy, Accessibility and Store Dossier
+### Task 10: Complete Live TV and DVR on Every Target
+
+**Files:**
+- Create Apple: `Sources/LiveTV/{Guide,Player,Timeshift,DVR,Recordings}/**`
+- Create Android: `:feature-livetv`, `:livetv-player`, `:feature-recordings`
+- Consume contracts: `schema/livetv/*.schema.json`, `fixtures/livetv/*.json`
+
+**Interfaces:**
+- Consumes the capability-gated Vondel Live TV API produced by `2026-08-12-vondel-prairie-livetv.md` Task 9.
+- Produces original guide, live player, timeshift, DVR and recordings experiences on all seven targets.
+
+- [ ] Write RED contract/platform tests using invented channels `KVDL-7`/`KVDL-12` for capability-hidden behavior, guide windows, tune, heartbeat, pause/resume/seek-live, record/cancel, series rules, conflicts and completed/failed recordings.
+- [ ] Implement original TV-first spatial guide grids and channel/player overlays independently in SwiftUI and Compose; do not inspect Prairie/Silo client source or reuse Vondel web layouts.
+- [ ] Implement touch/keyboard adaptations for iPhone, iPad, macOS, Android phone and Android tablet from each platform's design system.
+- [ ] Integrate live playback plans with the independent Apple/Android playback coordinators; protect short-lived tokens, recover sessions and surface typed tuner/guide/disk/conflict errors.
+- [ ] Implement profile-scoped DVR rule/conflict/recordings flows and capability-negative behavior for official Silo servers without Live TV.
+- [ ] Run TV focus, accessibility, guide timezone/DST, tuner exhaustion, timeshift expiry, process/network recovery and recordings suites; run originality source/asset/visual checks; commit/push both clients with exact-head CI green.
+
+### Task 11: Full Matrix, Privacy, Accessibility and Store Dossier
 
 **Files:**
 - Create contracts: `cmd/full-client-matrix/**`, `docs/conformance-report.md`
@@ -221,8 +240,8 @@ func testProfileSwitchRejectsPreviousScopeResult() async throws {
 **Interfaces:**
 - Produces signed evidence that gates—but does not guarantee—store submission.
 
-- [ ] Run the disposable-server conformance suite for all six media types against Vondel and the baseline subset against official Silo commit `1dcdd4b27ab5fcd697a32fc20f20c2400ca24688`.
-- [ ] Run the complete device/form-factor matrix for iPhone, iPad, macOS, Apple TV, Android phone, Android tablet and Android TV, including Watch, Listen, Read, offline and identity switching.
+- [ ] Run the disposable-server conformance suite for all six library media types plus Live TV/DVR against Vondel and the capability-supported baseline subset against official Silo commit `1dcdd4b27ab5fcd697a32fc20f20c2400ca24688`.
+- [ ] Run the complete device/form-factor matrix for iPhone, iPad, macOS, Apple TV, Android phone, Android tablet and Android TV, including Watch, Listen, Read, Live TV/DVR, offline and identity switching.
 - [ ] Run accessibility, localization, privacy, security, dependency-license, credential, originality source/asset and visual-composition gates.
 - [ ] Create Vondel-owned icons/screenshots/previews with invented demo media, accurate privacy/support URLs and stable reviewer credentials/demo server.
 - [ ] Generate the originality dossier from Git history, specifications, provenance ledgers, similarity reports, dependencies and build/test results; require zero unexplained findings.

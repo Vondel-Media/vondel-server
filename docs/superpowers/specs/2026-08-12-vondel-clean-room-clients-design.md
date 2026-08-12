@@ -15,6 +15,8 @@ Build two genuinely independent, publishable native client families for Vondel a
 - ebooks;
 - manga.
 
+They also include the complete capability-gated Live TV experience defined by `2026-08-12-vondel-prairie-livetv-design.md`: channel guide, live playback, timeshift, one-off/series DVR, conflicts and recordings.
+
 All target platforms exist from the beginning. tvOS and Android TV lead product development, but store submission waits until the complete Apple and Android platform matrices satisfy the acceptance criteria.
 
 These applications are not rewrites, reskins, ports, or disguised forks of the Silo reference clients. They begin in empty repositories and use original source code, architecture, navigation, visual design, assets, naming, tests, and release metadata. Compatibility is implemented from documented server interfaces and black-box protocol fixtures.
@@ -156,6 +158,10 @@ One search flow groups results by Watch, Listen and Read, with filters that reve
 
 An original cross-media activity surface combines continue watching, continue listening, continue reading, active downloads, recently added items and device handoff. This is the central differentiator and is not modeled on the reference clients.
 
+### Live TV
+
+An original TV-first spatial guide presents channels, now/next, program details, live playback and live-edge/timeshift state. DVR flows cover record/cancel, series rules, deterministic conflicts and completed/failed recordings. Live TV appears only when the connected server advertises the versioned capability; compatible official Silo servers without it show no dead navigation.
+
 ## TV-first interaction model
 
 tvOS and Android TV are the first production-complete vertical slices. They use an original cinematic spatial composition with large editorial canvases, deliberate remote focus movement and platform-native transport controls.
@@ -263,6 +269,8 @@ Store submission is blocked until movies, episodic television, music, audiobooks
 - Android tablet;
 - Android TV.
 
+The same seven-target matrix must pass guide, tune, heartbeat/recovery, pause/resume/seek-live, one-off/series record, conflict and recordings behavior when connected to a Live TV-capable Vondel Server.
+
 Implementation proceeds in vertical slices, but a partially covered media or platform matrix is not called the initial release.
 
 ## Store-review package
@@ -305,7 +313,8 @@ The new contracts and client repositories use `AGPL-3.0-or-later`, consistent wi
 6. Add Read, including ebooks and manga, across all targets.
 7. Complete phone/tablet/macOS Watch experiences and shared cross-media Now behavior.
 8. Complete downloads, recovery, accessibility, localization, privacy and store metadata.
-9. Run the full platform/media acceptance matrix and prepare reviewer environments/dossiers.
+9. Complete the capability-gated Live TV/DVR vertical slice on every target after the Vondel Live TV contracts are published.
+10. Run the full platform/media/Live TV acceptance matrix and prepare reviewer environments/dossiers.
 
 Tasks may run concurrently when they touch independent repositories or media coordinators, but conformance and identity-scoping gates remain prerequisites for feature integration.
 
@@ -315,7 +324,7 @@ The clean-room client project is ready for store submission only when:
 
 - all three new repositories begin from empty Vondel roots and contain no reference source/assets;
 - Apple and Android use independently designed native architectures and interfaces;
-- the six media categories work across the seven target form factors;
+- the six library media categories and capability-gated Live TV/DVR work across the seven target form factors;
 - both Vondel and capability-compatible official Silo servers pass conformance;
 - TV focus/navigation and all playback/reader matrices pass;
 - offline bundles, profile scoping, retries and diagnostics pass safety tests;
