@@ -55,7 +55,18 @@ git -C /Users/jimcole/projects/vondel-plugin-sdk status --porcelain
 
 Expected: the printed revision is the pinned SHA and status is empty.
 
-- [ ] **Step 3: Replace the imported history with a clean root without changing files**
+- [ ] **Step 3: Verify the imported baseline before changing identity**
+
+Run from `/Users/jimcole/projects/vondel-plugin-sdk`:
+
+```bash
+GOWORK=off go mod download
+GOWORK=off go test ./...
+```
+
+Expected: all upstream SDK and example-package tests PASS before Vondel changes.
+
+- [ ] **Step 4: Replace the imported history with a clean root without changing files**
 
 Run from `/Users/jimcole/projects/vondel-plugin-sdk`:
 
@@ -74,7 +85,7 @@ test "$(git rev-list --parents -n 1 HEAD | wc -w | tr -d ' ')" = 1
 
 Expected: `main` contains one zero-parent snapshot commit and upstream cannot receive pushes.
 
-- [ ] **Step 4: Create the private remote and push the snapshot**
+- [ ] **Step 5: Create the private remote and push the snapshot**
 
 Run:
 
@@ -90,7 +101,7 @@ gh api repos/Vondel-Media/vondel-plugin-sdk --jq '{visibility,private,default_br
 
 Expected: visibility is `private`, `private` is `true`, and default branch is `main`.
 
-- [ ] **Step 5: Commit is already created; record the import revision in the next legal-identity task**
+- [ ] **Step 6: Commit is already created; record the import revision in the next legal-identity task**
 
 No additional commit is created in this step. Verify `git status --porcelain` is empty.
 
