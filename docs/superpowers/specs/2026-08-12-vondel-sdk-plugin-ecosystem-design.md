@@ -48,7 +48,9 @@ The first wave creates these private repositories in `Vondel-Media`:
 
 The SDK and catalog retain their upstream Apache-2.0 licenses. Plugin forks
 retain their respective upstream licenses, including AGPL-3.0-or-later where
-applicable. Every repository will include a notice naming its Silo upstream,
+applicable. The project owner has separately authorized the Ebook Metadata and
+Autoscan ARR imports under AGPL-3.0-or-later; those two repositories remain
+permanently private. Every repository will include a notice naming its Silo upstream,
 the imported revision, material Vondel modifications, and the lack of Silo
 affiliation or endorsement.
 
