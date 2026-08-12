@@ -1,127 +1,66 @@
-# Vondel Plugin Fork Inventory
+# Vondel Private Plugin Inventory
 
-Audit completed on 2026-08-12. This is the Task 7 whole-family gate for the eight private repositories created by the full plugin-forks plan.
+Verified on 2026-08-12. The active private plugin and future catalog scope contains exactly six retained plugins: TMDB, TVDB, Ebook Metadata, Audiobook Metadata, Manga Metadata, and Autoscan ARR.
 
-## Audit result
+## Release verification result
 
-- All eight repositories are `PRIVATE` on GitHub with default branch `main`.
-- Every audited local `main` is clean and exactly matches `origin/main`.
-- Each repository has exactly one zero-parent Vondel root. No upstream Git history or upstream tag is reachable from a Vondel repository.
-- No repository currently has a local or GitHub tag. No repository has a GitHub release.
-- The catalog and five licensed plugin imports have successful GitHub Actions CI at the exact audited HEAD. Ebook and Autoscan ARR intentionally have no workflow.
-- Every imported license is byte-for-byte identical to the license at its pinned upstream snapshot.
-- Every Go repository uses its Vondel module path, pins `github.com/Vondel-Media/vondel-plugin-sdk v0.13.3`, and has no `replace` directive in current files or reachable history.
-- Compatibility identities remain in the Silo v1 namespace. Repository and build ownership changed to Vondel; wire, storage, provider, capability, configuration, and image-scheme identities did not.
-- Known embedded TMDB and TVDB upstream credentials are absent from current files and all reachable Vondel history. No executable workflow contains a Silo catalog dispatch, credential-bearing URL, public-registry publication, or repository-visibility mutation.
-- Ebook and Autoscan ARR remain private permission gates containing no copied upstream source.
+All six repositories and Releases are private. Each repository is clean at the exact `origin/main` commit peeled from its annotated release tag, and its exact-head CI and exact-tag release workflow completed successfully. Every Release is published, non-draft, non-prerelease, and contains exactly:
 
-## Exact repository state
-
-| Repository | Audited HEAD | Zero-parent root | Upstream snapshot | License | Module / SDK | CI at HEAD | Tags / releases |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| `Vondel-Media/vondel-plugins` | `8092a780eee2091894bf3a25087b115a925d12cf` | `42f7f3ca2dc78246eb68368cc323bc0e9899915a` | `Silo-Server/silo-plugins@934b867f69e6b140dcaf90efe56c43da63893f3f` | Apache-2.0 | `github.com/Vondel-Media/vondel-plugins`; SDK `v0.13.3` | success, run [`31597408813`](https://github.com/Vondel-Media/vondel-plugins/actions/runs/31597408813) | none / none |
-| `Vondel-Media/vondel-plugin-metadb` | `0115c5b222fd2d913289bdb011694aad796d5ce7` | `304fb84e1619afa64f54d535477c86aa7b2536ce` | `RXWatcher/silo-plugin-metadb@daf85c59aac440538d13223db6d644ccd240e345` | AGPL-3.0-or-later | `github.com/Vondel-Media/vondel-plugin-metadb`; SDK `v0.13.3` | success, run [`31599574925`](https://github.com/Vondel-Media/vondel-plugin-metadb/actions/runs/31599574925) | none / none |
-| `Vondel-Media/vondel-plugin-tmdb` | `cad31a3a683b50107a126dd7a252c48527c10cfe` | same as HEAD | `Silo-Server/silo-plugin-metadata-tmdb@v1.2.21` (`7bae6ba7d99f49587128dfcb0a56bee6800c6ad0`) | AGPL-3.0-or-later | `github.com/Vondel-Media/vondel-plugin-tmdb`; SDK `v0.13.3` | success, run [`31599405419`](https://github.com/Vondel-Media/vondel-plugin-tmdb/actions/runs/31599405419) | none / none |
-| `Vondel-Media/vondel-plugin-tvdb` | `084b05a2d2b3d218168e379574e73d9e529f9672` | same as HEAD | `Silo-Server/silo-plugin-metadata-tvdb@v1.2.24` (`a04e5a21427e2d9c2f63522603190c81f0017da8`) | AGPL-3.0-or-later | `github.com/Vondel-Media/vondel-plugin-tvdb`; SDK `v0.13.3` | success, run [`31600316437`](https://github.com/Vondel-Media/vondel-plugin-tvdb/actions/runs/31600316437) | none / none |
-| `Vondel-Media/vondel-plugin-audiobook-metadata` | `fea20422d4d086519b9517ab0dae870092324068` | `5c35b8cf1e6cc56b0f2eb232f0f8e389a5c146ea` | `Silo-Server/silo-plugin-metadata-audiobook@v0.1.4` (`f85c630ecbbe5ef760cae1af4b8fdfb1d666397c`) | AGPL-3.0-only | `github.com/Vondel-Media/vondel-plugin-audiobook-metadata`; SDK `v0.13.3` | success, run [`31599245243`](https://github.com/Vondel-Media/vondel-plugin-audiobook-metadata/actions/runs/31599245243) | none / none |
-| `Vondel-Media/vondel-plugin-manga-metadata` | `13d41c7406d729fa18595c9a3aee965efa6628ed` | `600c4981452a587359e4f94a431c4ba7843b7a1c` | `Silo-Server/silo-plugin-metadata-manga@v0.1.1` (`1458a58663081bff45da3230f783d55d4955852a`) | AGPL-3.0-only; MangaBaka data remains CC BY-NC-SA 4.0 | `github.com/Vondel-Media/vondel-plugin-manga-metadata`; SDK `v0.13.3` | success, run [`31599256457`](https://github.com/Vondel-Media/vondel-plugin-manga-metadata/actions/runs/31599256457) | none / none |
-| `Vondel-Media/vondel-plugin-ebook-metadata` | `5583aaf95fe3690f9be4f32df03da6f276c6688f` | same as HEAD | metadata only: `Silo-Server/silo-plugin-metadata-ebook@v0.1.1` (`70d8acb4dbb68f8cc594099258211cd9a3a3082f`) | none at reviewed snapshot; import blocked | none | intentionally none | none / none |
-| `Vondel-Media/vondel-plugin-autoscan-arr` | `bde63ecf3f9e74d4bb84c696a54edc17b2f101ff` | same as HEAD | metadata only: `Silo-Server/silo-plugin-autoscan-arr@v0.1.2` (`7987ddae852549f5f2ef4e00b6f25dfa5497ddad`) | none at reviewed snapshot; import blocked | none | intentionally none | none / none |
-
-All eight origins use `git@github.com:Vondel-Media/<repository>.git` for fetch and push. Upstream remotes are fetch-only:
-
-| Repository | Upstream fetch URL | Upstream push URL |
-| --- | --- | --- |
-| `vondel-plugins` | `https://github.com/Silo-Server/silo-plugins.git` | `DISABLED` |
-| `vondel-plugin-metadb` | `https://github.com/RXWatcher/silo-plugin-metadb.git` | `no_push` |
-| `vondel-plugin-tmdb` | `https://github.com/Silo-Server/silo-plugin-metadata-tmdb.git` | `no_push` |
-| `vondel-plugin-tvdb` | `https://github.com/Silo-Server/silo-plugin-metadata-tvdb.git` | `no_push` |
-| `vondel-plugin-audiobook-metadata` | `https://github.com/Silo-Server/silo-plugin-metadata-audiobook.git` | `DISABLED` |
-| `vondel-plugin-manga-metadata` | `https://github.com/Silo-Server/silo-plugin-metadata-manga.git` | `DISABLED` |
-| `vondel-plugin-ebook-metadata` | `https://github.com/Silo-Server/silo-plugin-metadata-ebook.git` | `DISABLED` |
-| `vondel-plugin-autoscan-arr` | `https://github.com/Silo-Server/silo-plugin-autoscan-arr.git` | `DISABLED` |
-
-## License evidence
-
-The catalog license has SHA-256 `6cf63d87586c7c25c3ab8e62eef5c75bbaa982b0a6f9c00c59e2720255aac9ec`. The five licensed plugin snapshots share preserved `LICENSE` SHA-256 `be81e1ded9055f0a6c6ea337716140e73fc10a3d18a482f5ade024364cc0f2e0`. Each digest was recomputed from the Vondel file and its exact pinned upstream file and matched byte-for-byte.
-
-The Ebook and Autoscan ARR snapshots contain no redistribution license. Each Vondel repository therefore has exactly four tracked files:
-
-- `.gitignore`
-- `README.md`
-- `SOURCE_IMPORT_BLOCKED`
-- `UPSTREAM.md`
-
-They have no copied source, fixture, manifest, Go module, workflow, or license assertion. Import remains blocked until the copyright holder supplies a redistribution license or written permission.
-
-## Compatibility inventory
-
-All imported plugin manifests declare `silo_api_version: v1` and support `darwin/arm64`, `linux/amd64`, and `linux/arm64`.
-
-| Plugin | Manifest version | Plugin ID | Capability IDs and invariant metadata | Preserved configuration |
-| --- | --- | --- | --- | --- |
-| MetaDB | `1.0.0` | `silo.metadb` | `metadata_provider.v1/metadb`; movie, series, season, episode priorities all `1` | `SILO_METADB_URL`, `SILO_METADB_API_KEY`, `SILO_METADB_S3_ENDPOINT`, `SILO_METADB_S3_REGION`, `SILO_METADB_S3_BUCKET`, `SILO_METADB_S3_ACCESS_KEY`, `SILO_METADB_S3_SECRET_KEY` |
-| TMDB | `1.2.21` | `silo.tmdb` | `metadata_provider.v1/tmdb`; priorities movie `2`, series/season/episode `3`; `image_resolver.v1/tmdb`, scheme `tmdb`, priority `100` | required global secret/password `api_key`, held in memory |
-| TVDB | `1.2.24` | `silo.tvdb` | `metadata_provider.v1/tvdb`; series/season/episode priorities all `2`; `image_resolver.v1/tvdb`, scheme `tvdb`, priority `100` | required global secret/password `api_key`; bearer token remains in memory |
-| Audiobook Metadata | `0.1.4` | `silo.audiobook-metadata` | `metadata_provider.v1/audiobook-metadata`; audiobook priority `2` | none |
-| Manga Metadata | `0.1.1` | `silo.manga-metadata` | `metadata_provider.v1/manga-metadata`; manga priority `1` | `enabled_sources`, `enable_local_dump`, `dump_path`, `dump_refresh_hours`, `enable_anilist_banners` |
-
-MetaDB intentionally does not advertise `image_resolver.v1`; adding that capability requires a separate behavior and registration compatibility review.
-
-Each release-capable plugin preserves the later catalog asset contract:
-
+- `plugin-darwin-arm64`
 - `plugin-linux-amd64`
 - `plugin-linux-arm64`
-- `plugin-darwin-arm64`
 - `checksums.txt`
 
-The manifests retain `__CHECKSUM__` until the release/catalog publication phase.
+Each downloaded `checksums.txt` has a strict three-entry bijection using bare asset names, and all three downloaded binaries verify. The compatible Darwin binary returns the exact plugin ID and version below and self-reports its own downloaded SHA-256. Applicable source, reachable-history, and binary credential-fingerprint scans passed.
 
-## Automation inventory
+| Plugin | Private release | Peeled `origin/main` commit | Exact-head CI | Exact-tag release run | Self-manifest |
+| --- | --- | --- | --- | --- | --- |
+| TMDB | [`v1.2.23`](https://github.com/Vondel-Media/vondel-plugin-tmdb/releases/tag/v1.2.23) | `9ce9b82ef529aa8112aa814dcc89a422d4443eb0` | [`31612837393`](https://github.com/Vondel-Media/vondel-plugin-tmdb/actions/runs/31612837393) | [`31613669453`](https://github.com/Vondel-Media/vondel-plugin-tmdb/actions/runs/31613669453) | `silo.tmdb` / `1.2.23` |
+| TVDB | [`v1.2.27`](https://github.com/Vondel-Media/vondel-plugin-tvdb/releases/tag/v1.2.27) | `a2cc114d7d4c8eaab911a18a289c522813d1ab9d` | [`31615200219`](https://github.com/Vondel-Media/vondel-plugin-tvdb/actions/runs/31615200219) | [`31615507041`](https://github.com/Vondel-Media/vondel-plugin-tvdb/actions/runs/31615507041) | `silo.tvdb` / `1.2.27` |
+| Ebook Metadata | [`v0.1.3`](https://github.com/Vondel-Media/vondel-plugin-ebook-metadata/releases/tag/v0.1.3) | `22a1c8b77e2827b77d3ce96144924494548c01d1` | [`31612866065`](https://github.com/Vondel-Media/vondel-plugin-ebook-metadata/actions/runs/31612866065) | [`31613699932`](https://github.com/Vondel-Media/vondel-plugin-ebook-metadata/actions/runs/31613699932) | `silo.ebook-metadata` / `0.1.3` |
+| Audiobook Metadata | [`v0.1.6`](https://github.com/Vondel-Media/vondel-plugin-audiobook-metadata/releases/tag/v0.1.6) | `7bc466cec0e455ca63c6aafc13d13cbc531bc623` | [`31612879674`](https://github.com/Vondel-Media/vondel-plugin-audiobook-metadata/actions/runs/31612879674) | [`31613716200`](https://github.com/Vondel-Media/vondel-plugin-audiobook-metadata/actions/runs/31613716200) | `silo.audiobook-metadata` / `0.1.6` |
+| Manga Metadata | [`v0.1.3`](https://github.com/Vondel-Media/vondel-plugin-manga-metadata/releases/tag/v0.1.3) | `03fd668f7234cc2624d1d0f6aef98abd66b8f8c5` | [`31612894814`](https://github.com/Vondel-Media/vondel-plugin-manga-metadata/actions/runs/31612894814) | [`31613733260`](https://github.com/Vondel-Media/vondel-plugin-manga-metadata/actions/runs/31613733260) | `silo.manga-metadata` / `0.1.3` |
+| Autoscan ARR | [`v0.1.4`](https://github.com/Vondel-Media/vondel-plugin-autoscan-arr/releases/tag/v0.1.4) | `f11998586b51e0c413f82c7d01aa7239d5cb526a` | [`31612907100`](https://github.com/Vondel-Media/vondel-plugin-autoscan-arr/actions/runs/31612907100) | [`31613748655`](https://github.com/Vondel-Media/vondel-plugin-autoscan-arr/actions/runs/31613748655) | `silo.autoscan.arr` / `0.1.4` |
 
-All listed workflows are active:
+## Verified asset hashes
 
-- Catalog: `CI` and `Update Catalog`.
-- MetaDB: `CI`; this plan does not create a release workflow for MetaDB.
-- TMDB and TVDB: `CI` and tag-only `Private Release`.
-- Audiobook and Manga: `CI` and tag-only `Private release`.
-- Ebook and Autoscan ARR: no workflows.
+| Plugin | `plugin-darwin-arm64` | `plugin-linux-amd64` | `plugin-linux-arm64` | `checksums.txt` |
+| --- | --- | --- | --- | --- |
+| TMDB | `9edfb5c8577da59dae7e6cb653198a42463efe483d16d050579095f92ad83d67` | `52c61dd9dfc8e9f27daebd8d81c5ce1ae77541b43c3881572e59d7a00372f319` | `48065958ffe0fc6c0b674c6a24c8eeb790d0f8dab52ce2a6c7218e7d00603e01` | `8c857e5ad0c1578da05b0197b10035c57433d9386bfed766f213ab459d9380d8` |
+| TVDB | `6c558ea7b735063e51d500289b605337e011e7a84d88900941dfe5db41aa84e1` | `353f9df58ed42e39c524faa7deb7d51b4fe58c11819a945ad8fd44dc43a66d11` | `7cbd7ae07f8d6fc9089364732131dc0dc0de6bb88f6cdd5dc8f28672e73a361c` | `a23fc8d78b7a6c838c2a8f11ae4a4c3adba5cab781e7edc604c6268262a2f823` |
+| Ebook Metadata | `30763cffd528d8b2187e5155fe8faf8eb51f25069eb403916b1b156dbdc522fd` | `f171c5ebb20f1d8756a7a290c6b42222677b9a7a3f819fb80a2ed99dbd3fd864` | `81da1c08cd67ce67bf814d724ba7e7f16ee100fd2f58b24154fc7840eba39f92` | `49d09d90c95da25d77c13b484a41db7ecb8ec7fdfe093795686d25df9da98802` |
+| Audiobook Metadata | `dd03570b6dda52660d6697b80159172634e8c4e56cf780c9f8e91e8e5a428646` | `c9e91fcd3c433669c8b1dc446910dbe403cf70cf9825bba92e7c474c222371c3` | `ed5b1fe9ae172d928ee30c6b9e38de44ec8242fc0a2045d326c69530d99160d7` | `86704fb4c00f00d7c51d781dfba40b8ad03b05a69af281e1f75a1abfce45840f` |
+| Manga Metadata | `0cf1bdd48ea0e6aaf3a5bf13ab049dc6f12337f8c9b16c8dd51ce5343bcf5555` | `cbbae95b912c71877771a483cdf33a757be95c1445d206492a5dfa9f0f173819` | `e9e635b40019287a8f0c1855e3876006da656a0c00aee5ef53d063ebe13576ba` | `bbcafc18b1278e525941cb782e32c470c3524bf9e4fb41a916a4a79e29c76631` |
+| Autoscan ARR | `8c60acfc01242d815c7ecc98987f998db08c3af2eef834c1a30d9fa6dd30739c` | `8e353a06fc951c21a6573dddfa5db824bf0dcfdc9fc800a687281e0be42b158d` | `e3a1652640dcf0360c6e414c8b1021c21b38ceef3feaa401fca8c838354be2fb` | `e58a3e8383f01ccf61c19b0ba30b1f6b86729d1e6b7f0128e4f64a74eac30323` |
 
-The catalog updater uses Vondel-only source and push credentials and a literal Vondel repository allowlist. Release workflows verify repository privacy and an exact source tag before preparing the four expected assets. None has been triggered because there are no tags or releases.
+## Provenance and authorization
 
-## Verification evidence
+Every repository has a clean Vondel root with no upstream Git history or tags reachable from it, uses its `github.com/Vondel-Media/...` module path, pins private SDK `v0.13.3` without a `replace` directive, and keeps its upstream remote fetch-only. The common preserved AGPL license file has SHA-256 `be81e1ded9055f0a6c6ea337716140e73fc10a3d18a482f5ade024364cc0f2e0`.
 
-For the catalog, the audit passed:
+| Plugin | Vondel root | Pinned upstream snapshot | AGPL authorization status |
+| --- | --- | --- | --- |
+| TMDB | `cad31a3a683b50107a126dd7a252c48527c10cfe` | `Silo-Server/silo-plugin-metadata-tmdb@v1.2.21` (`7bae6ba7d99f49587128dfcb0a56bee6800c6ad0`) | Upstream AGPL-3.0-or-later preserved byte-for-byte |
+| TVDB | `084b05a2d2b3d218168e379574e73d9e529f9672` | `Silo-Server/silo-plugin-metadata-tvdb@v1.2.24` (`a04e5a21427e2d9c2f63522603190c81f0017da8`) | Upstream AGPL-3.0-or-later preserved byte-for-byte |
+| Ebook Metadata | `5583aaf95fe3690f9be4f32df03da6f276c6688f` | `Silo-Server/silo-plugin-metadata-ebook@v0.1.1` (`70d8acb4dbb68f8cc594099258211cd9a3a3082f`) | Project-owner authorization to copy, modify, and license the Vondel copy under AGPL-3.0-or-later |
+| Audiobook Metadata | `5c35b8cf1e6cc56b0f2eb232f0f8e389a5c146ea` | `Silo-Server/silo-plugin-metadata-audiobook@v0.1.4` (`f85c630ecbbe5ef760cae1af4b8fdfb1d666397c`) | Upstream AGPL-3.0-only preserved; release remains under that authorization |
+| Manga Metadata | `600c4981452a587359e4f94a431c4ba7843b7a1c` | `Silo-Server/silo-plugin-metadata-manga@v0.1.1` (`1458a58663081bff45da3230f783d55d4955852a`) | Upstream AGPL-3.0-only preserved; MangaBaka data remains CC BY-NC-SA 4.0 |
+| Autoscan ARR | `bde63ecf3f9e74d4bb84c696a54edc17b2f101ff` | `Silo-Server/silo-plugin-autoscan-arr@v0.1.2` (`7987ddae852549f5f2ef4e00b6f25dfa5497ddad`) | Project-owner authorization to copy, modify, and license the Vondel copy under AGPL-3.0-or-later |
 
-```text
-GOWORK=off go mod tidy -diff
-GOWORK=off go test ./...
-GOWORK=off go vet ./...
-GOWORK=off go build ./...
-jq empty manifest.json
-git diff --check
-```
+## Compatibility and security invariants
 
-For MetaDB, TMDB, TVDB, Audiobook, and Manga, the audit additionally passed `go test -race ./...` and clean cross-builds for Linux amd64, Linux arm64, and Darwin arm64. Each repository's applicable private-source, embedded-credential, fork-policy, and private-release guard suites also passed. Manga's optional networked `MANGABAKA_LIVE=1` test was not run and is not part of the non-secret CI gate.
+All manifests retain `silo_api_version: v1` and support Darwin arm64, Linux amd64, and Linux arm64.
 
-## Secret and publication scan
+| Plugin | Capability and invariant metadata | Preserved configuration |
+| --- | --- | --- |
+| TMDB | `metadata_provider.v1/tmdb`; movie priority `2`, series/season/episode `3`; `image_resolver.v1/tmdb`, scheme `tmdb`, priority `100` | required secret/password `api_key`, retained only in memory |
+| TVDB | `metadata_provider.v1/tvdb`; series/season/episode priority `2`; `image_resolver.v1/tvdb`, scheme `tvdb`, priority `100` | required secret/password `api_key`; bearer token retained only in memory |
+| Ebook Metadata | `metadata_provider.v1/ebook-metadata`; ebook priority `2` | `enabled_sources`, `google_books_api_key`, `isbndb_api_key`, `hardcover_api_key`, `default_region` |
+| Audiobook Metadata | `metadata_provider.v1/audiobook-metadata`; audiobook priority `2` | none |
+| Manga Metadata | `metadata_provider.v1/manga-metadata`; manga priority `1` | `enabled_sources`, `enable_local_dump`, `dump_path`, `dump_refresh_hours`, `enable_anilist_banners` |
+| Autoscan ARR | `scan_source.v1/arr` | none |
 
-The audit derived the two known credentials directly from the exact upstream TMDB and TVDB commits, without reproducing their values. Their non-secret fingerprints were:
+The known upstream TMDB credential fingerprint (length 32, SHA-256 prefix `b606194c5bac`) and TVDB credential fingerprint (length 36, prefix `883b8232685a`) are absent from current files, reachable histories, and downloaded release binaries. Release and CI workflows use credentialless source checkouts, enforce private visibility and exact annotated tags, and contain no Silo catalog dispatch, public-registry publication, or visibility-to-public operation.
 
-- TMDB: length 32, SHA-256 prefix `b606194c5bac`
-- TVDB: length 36, SHA-256 prefix `883b8232685a`
+## Next phase
 
-For every Vondel repository, exact-value searches returned zero current files and zero reachable commit paths. Reachable-history searches also returned zero Go `replace` directives. Direct workflow searches returned zero credential-bearing URLs, Silo catalog dispatch tokens/endpoints, public-registry publication commands, and visibility-to-public mutations.
-
-Broad whole-history searches match deliberately forbidden examples or detection regexes in TMDB/TVDB guard tests and `scripts/verify-private-source.sh`. These are negative test fixtures, not credentials or executable workflow actions. Factual upstream URLs in `NOTICE` and `UPSTREAM.md` are required provenance and are not publication regressions.
-
-## Delivery gate and next phase
-
-The source-fork phase is complete, but the private GitHub catalog and private GitHub releases cannot be consumed anonymously by the current server. There are deliberately no tags, plugin release assets, or catalog entries yet.
-
-The next phase must:
-
-1. create reviewed private plugin releases with the exact four-asset contract;
-2. add those releases to the private catalog only after checksum and platform validation;
-3. establish a local or authenticated staging delivery path instead of anonymous GitHub fetching; and
-4. run the core movie/series scan acceptance suite against staged TMDB and TVDB delivery before production publication decisions.
+The six verified private Releases are the complete active input to the private catalog and staging materialization work. No catalog entry or public/default server behavior is changed by this inventory. Private GitHub assets must be authenticated during materialization and exposed to the server only through the planned token-free network-local staging catalog.
