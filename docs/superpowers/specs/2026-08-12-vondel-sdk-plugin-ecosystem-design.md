@@ -34,7 +34,7 @@ catalog URLs will use Vondel.
 
 ## Repository family
 
-The first wave creates these public repositories in `Vondel-Media`:
+The first wave creates these private repositories in `Vondel-Media`:
 
 1. `vondel-plugin-sdk`
 2. `vondel-plugins`
@@ -56,6 +56,10 @@ Each repository begins with a clean Vondel root commit so reserved Silo visual
 assets and unrelated historical automation are not republished through the new
 Git history. Required copyright and license notices remain in the source
 snapshot and root notice.
+
+All repositories, releases, packages, catalog files, build artifacts, and CI
+logs remain private until the owner approves a coordinated public release.
+Creating the repositories does not authorize publishing any component.
 
 ## SDK architecture
 
@@ -86,14 +90,23 @@ release only after the SDK's parity and wire-compatibility suites pass.
 Its manifest points exclusively to Vondel-owned repositories, release assets,
 and checksums. It never silently proxies mutable upstream binaries.
 
+During private development, integration tests consume the catalog from a local
+checkout or an authenticated staging endpoint. Vondel Server's public defaults
+must not reference a private GitHub URL or require an organization credential.
+No private repository token may be embedded in a server binary, image, catalog,
+test fixture, or committed configuration.
+
 The catalog updater receives release dispatches from Vondel plugin repositories,
 fetches the tagged manifest and checksums, validates supported platforms and
 capabilities, and updates the catalog through a reviewable commit. Repository
 tokens and dispatch secrets use Vondel-specific names.
 
 Vondel Server's default catalog URL will switch to the Vondel catalog only after
-the initial provider releases exist. Operators may still add the official Silo
-catalog as a custom source where the server permits custom catalogs.
+the initial provider releases exist and the owner approves publication. Until
+then, released Vondel Server builds keep their existing catalog behavior, while
+private integration environments opt into the staging catalog explicitly.
+Operators may still add the official Silo catalog as a custom source where the
+server permits custom catalogs.
 
 ## Initial plugin set
 
@@ -144,11 +157,13 @@ secrets.
 
 Releases occur in this order:
 
-1. Publish and tag `vondel-plugin-sdk`.
+1. Tag `vondel-plugin-sdk` in its private repository.
 2. Build MetaDB, TMDB, and TVDB against that exact SDK tag.
-3. Publish their multi-platform binaries and checksums.
-4. Publish `vondel-plugins` with those verified releases.
-5. Switch Vondel Server's SDK dependency and default catalog URL.
+3. Create private multi-platform release artifacts and checksums.
+4. Update the private `vondel-plugins` staging catalog with those verified
+   releases.
+5. Switch Vondel Server's SDK dependency and private integration configuration;
+   defer changing its public default catalog URL.
 6. Run the clean-install movie and series scan acceptance suite.
 7. Repeat the plugin release/catalog process for audiobook, ebook, manga, and
    ARR autoscan.
@@ -164,9 +179,9 @@ The initial release matrix follows the current Silo plugin ecosystem:
 - Linux ARM64
 - macOS ARM64 where the plugin supports it upstream
 
-Each release publishes deterministic binary names and a checksum file. The
-catalog only advertises assets that exist and whose checksum verification has
-passed.
+Each private release produces deterministic binary names and a checksum file.
+The staging catalog only advertises assets that exist and whose checksum
+verification has passed.
 
 ## Error handling and security
 
@@ -180,6 +195,8 @@ passed.
   from logs, test fixtures, releases, and catalog metadata.
 - Catalog automation receives only the minimum repository permissions needed
   for release discovery and catalog updates.
+- Private repository credentials are injected only at CI/runtime boundaries,
+  are never printed, and are revoked or rotated before publication.
 
 ## Testing
 
@@ -210,10 +227,33 @@ Authentication, guest access, request routing, live TV, WHMCS, public catalog,
 support, adult-content, themes, and other integrations may follow after the
 media-ingestion pipeline is reliable.
 
+## Publication gate
+
+Publication is a separate, owner-approved operation. Before any repository or
+artifact becomes public, the release checklist must confirm:
+
+- attribution, license, trademark, and third-party asset reviews pass in every
+  repository;
+- no secrets, private URLs, personal identifiers, internal workflow hooks, or
+  reserved Silo artwork exist in current files or reachable Git history;
+- public release assets and checksums are rebuilt from reviewed commits;
+- catalog URLs resolve without private credentials;
+- Vondel and pinned official Silo compatibility suites pass against those exact
+  public candidate binaries;
+- documentation clearly identifies Vondel as independent and credits each Silo
+  upstream;
+- the owner explicitly approves the repositories and release artifacts to be
+  made public.
+
+Repositories will not be automatically published as a side effect of passing
+CI or completing the implementation plan.
+
 ## Completion criteria
 
-The first wave is complete when all nine repositories are public under
-`Vondel-Media`, their attribution and licenses are correct, release automation
-publishes verified assets, the Vondel catalog references only Vondel-controlled
-releases, Vondel Server consumes the tagged SDK and catalog, and the full media
-scan acceptance matrix passes for the initial plugin set.
+The private first wave is complete when all nine repositories exist privately
+under `Vondel-Media`, their attribution and licenses are correct, release
+automation produces private verified assets, the staging catalog references
+only Vondel-controlled releases, Vondel Server consumes the tagged SDK and
+staging catalog in integration environments, and the full media scan acceptance
+matrix passes for the initial plugin set. Public release readiness is tracked
+separately and requires the publication gate above.
