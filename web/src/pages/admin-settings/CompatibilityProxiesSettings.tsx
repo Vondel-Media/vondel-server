@@ -295,8 +295,9 @@ export default function CompatibilityProxiesSettings() {
           <div className="space-y-4 py-3">
             <h3 className="text-sm font-medium">Web Component</h3>
             <p className="text-muted-foreground text-sm leading-relaxed">
-              The Web Component is separate from the API layer. Disabling the Web UI stops Vondel from
-              serving the route while keeping installed assets available for later reactivation.
+              The Web Component is separate from the API layer. Disabling the Web UI stops Vondel
+              from serving the route while keeping installed assets available for later
+              reactivation.
             </p>
 
             <div className="grid gap-x-8 md:grid-cols-2">

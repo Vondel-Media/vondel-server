@@ -326,8 +326,8 @@ function DiscordSetupGuide() {
             </li>
             <li>
               Bot page: reset and copy the <strong>Token</strong>. Leave all Privileged Gateway
-              Intents (Presence, Server Members, Message Content) <strong>off</strong> — Vondel never
-              connects to the gateway; it only sends DMs.
+              Intents (Presence, Server Members, Message Content) <strong>off</strong> — Vondel
+              never connects to the gateway; it only sends DMs.
             </li>
             <li>
               Keep <strong>Requires OAuth2 Code Grant</strong> off, or the invite link below
@@ -657,16 +657,16 @@ function MobilePushPrivacyDisclosure() {
       <div className="text-sm font-medium">Privacy disclosure</div>
       <div className="text-muted-foreground space-y-2 text-xs leading-relaxed">
         <p>
-          If you enable push notifications, your Vondel Server sends a content-free request to Vondel's
-          push relay so Vondel can deliver notifications through Apple Push Notification service or
-          Firebase Cloud Messaging.
+          If you enable push notifications, your Vondel Server sends a content-free request to
+          Vondel's push relay so Vondel can deliver notifications through Apple Push Notification
+          service or Firebase Cloud Messaging.
         </p>
         <p>
           The relay does not receive notification titles, message bodies, media names, user names,
           profile names, or your server URL. It does process technical metadata needed to deliver
           and operate the service, including an opaque deployment identifier, push delivery timing,
-          request status, app topic, the IP address your self-hosted Vondel Server uses to contact the
-          relay, and a hashed device push token. Apple or Google may also process standard push
+          request status, app topic, the IP address your self-hosted Vondel Server uses to contact
+          the relay, and a hashed device push token. Apple or Google may also process standard push
           delivery metadata for their platform.
         </p>
         <p>

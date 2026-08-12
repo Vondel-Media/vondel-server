@@ -48,7 +48,8 @@ const successMessages: Record<Exclude<SessionActionKind, "message">, string> = {
 
 const fallbackMessages: Record<Exclude<SessionActionKind, "message">, string> = {
   pause: "Pause could not reach the player directly. Vondel will end the session shortly instead.",
-  resume: "Resume could not reach the player directly. Vondel will end the session shortly instead.",
+  resume:
+    "Resume could not reach the player directly. Vondel will end the session shortly instead.",
   stop: "Stop could not reach the player directly. Vondel will end the session shortly instead.",
   terminate:
     "Terminate could not reach the player directly. Vondel will end the session shortly instead.",

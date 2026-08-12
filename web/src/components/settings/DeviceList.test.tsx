@@ -194,7 +194,11 @@ describe("DeviceList at scale", () => {
         changed_count: 2,
       }),
       ...Array.from({ length: 40 }, (_, i) =>
-        device({ device_id: `junk-${i}`, device_name: `Vondel-PR111-build-${i}`, last_seen_at: OLD }),
+        device({
+          device_id: `junk-${i}`,
+          device_name: `Vondel-PR111-build-${i}`,
+          last_seen_at: OLD,
+        }),
       ),
     ];
   }

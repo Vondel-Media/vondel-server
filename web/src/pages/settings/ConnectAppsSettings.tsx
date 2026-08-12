@@ -366,8 +366,8 @@ export default function ConnectAppsSettings() {
             <p className="text-sm font-medium">This account can't sign in to a Jellyfin app</p>
             <p className="text-muted-foreground mt-1 text-sm leading-relaxed">
               It signs in through an external provider rather than a Vondel password, and the
-              compatibility API only accepts Vondel passwords. Use a Vondel app, or ask an administrator
-              about an account with password sign-in.
+              compatibility API only accepts Vondel passwords. Use a Vondel app, or ask an
+              administrator about an account with password sign-in.
             </p>
           </div>
         ) : isJellyfin && !compatEnabled ? (
@@ -478,7 +478,8 @@ export default function ConnectAppsSettings() {
                 <X className="text-info mt-0.5 h-3.5 w-3.5 shrink-0" />
                 <span>
                   Jellyfin apps offer only two boxes and never prompt for a profile, so the profile
-                  name and PIN are appended here. This format is rejected on a Vondel sign-in screen.
+                  name and PIN are appended here. This format is rejected on a Vondel sign-in
+                  screen.
                 </span>
               </p>
             ) : (

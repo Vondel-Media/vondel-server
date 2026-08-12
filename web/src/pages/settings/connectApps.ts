@@ -1,6 +1,7 @@
 import type { Profile } from "@/api/types";
 
-export const SILO_APP_EXAMPLES = "Vondel for iPhone, Apple TV, Android, Android TV, and this website";
+export const SILO_APP_EXAMPLES =
+  "Vondel for iPhone, Apple TV, Android, Android TV, and this website";
 
 export const JELLYFIN_APP_EXAMPLES = "Infuse, Swiftfin, JellyCon, Findroid, Jellyfin Media Player";
 

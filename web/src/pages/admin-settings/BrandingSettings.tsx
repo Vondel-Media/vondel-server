@@ -118,8 +118,8 @@ export default function BrandingSettings() {
           <div>
             <h4 className="text-sm font-medium">Logos &amp; Icons</h4>
             <p className="text-muted-foreground mt-1 text-[13px]">
-              Upload custom images to replace the Vondel logo, browser favicon, and login background.
-              Each falls back to the Vondel default when not set.
+              Upload custom images to replace the Vondel logo, browser favicon, and login
+              background. Each falls back to the Vondel default when not set.
             </p>
           </div>
 

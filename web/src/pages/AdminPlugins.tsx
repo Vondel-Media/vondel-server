@@ -463,8 +463,8 @@ function InstalledPluginCard({
               Uninstall {pluginDisplayName(installation.plugin_id, presentation)}?
             </AlertDialogTitle>
             <AlertDialogDescription>
-              Vondel will stop the plugin, then remove its installation, configuration, and installed
-              files. This cannot be undone.
+              Vondel will stop the plugin, then remove its installation, configuration, and
+              installed files. This cannot be undone.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -820,8 +820,8 @@ function CommunityCatalogControl({ settings }: { settings: PluginCatalogSettings
             </label>
           </div>
           <p className="text-muted-foreground text-xs leading-relaxed">
-            Reviewed by Vondel maintainers to work as described and be safe for their documented use.
-            These plugins remain maintained and supported by community contributors.
+            Reviewed by Vondel maintainers to work as described and be safe for their documented
+            use. These plugins remain maintained and supported by community contributors.
           </p>
           {settings.migrated_plugin_count > 0 ? (
             <p className="text-muted-foreground text-xs">
@@ -946,7 +946,9 @@ function RepositorySection() {
               </div>
               <div className="flex shrink-0 gap-2">
                 {repo.managed ? (
-                  <span className="text-muted-foreground self-center text-xs">Managed by Vondel</span>
+                  <span className="text-muted-foreground self-center text-xs">
+                    Managed by Vondel
+                  </span>
                 ) : (
                   <>
                     <Button
