@@ -29,9 +29,17 @@ type AccessFilter struct {
 	PresentationOriginalLanguage string
 	MaxContentRating             string
 	MaxPlaybackQuality           string
-	SelectedFileID               int
-	UserID                       int
-	ProfileID                    string
+	// PlaybackDenied is transport metadata for compatibility surfaces. It is
+	// deliberately not a catalog predicate: browse-only members can still see
+	// the catalog, but cannot advertise or enter a playback transport.
+	PlaybackDenied bool
+	// DownloadDenied is separate from playback: Jelly's Download transport is
+	// also used by some direct-play clients, but may not bypass offline-download
+	// policy when a custom template permits playback and forbids downloads.
+	DownloadDenied bool
+	SelectedFileID int
+	UserID         int
+	ProfileID      string
 	// DeviceID identifies the requesting client for device-scoped setting
 	// resolution. It does not participate in catalog access control.
 	DeviceID string

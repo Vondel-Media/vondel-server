@@ -32,6 +32,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+
+	"github.com/Silo-Server/silo-server/internal/entitlements"
 )
 
 var (
@@ -53,26 +55,29 @@ const (
 
 // TenantOrganization is one park-sold organization plus its live usage.
 type TenantOrganization struct {
-	ID                 uuid.UUID
-	Name               string
-	ExternalOperatorID string
-	ExternalServiceID  string
-	Slots              int
-	Transcodes         int
-	SlotsUsed          int
-	Frozen             bool
-	FrozenReason       string
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	ID                         uuid.UUID
+	Name                       string
+	ExternalOperatorID         string
+	ExternalServiceID          string
+	Slots                      int
+	Transcodes                 int
+	SlotsUsed                  int
+	Frozen                     bool
+	FrozenReason               string
+	CreatedAt                  time.Time
+	UpdatedAt                  time.Time
+	AppliedEntitlementRevision int64
 }
 
 // CreateTenantOrganizationInput is the park-facing create request.
 type CreateTenantOrganizationInput struct {
-	Name               string
-	ExternalOperatorID string
-	ExternalServiceID  string
-	Slots              int
-	Transcodes         int
+	Name                        string
+	ExternalOperatorID          string
+	ExternalServiceID           string
+	Slots                       int
+	Transcodes                  int
+	EntitlementTemplateKey      string
+	EntitlementTemplateRevision int64
 }
 
 const tenantOrganizationColumns = `id, name, external_operator_id, external_service_id, slots, transcodes,
@@ -133,7 +138,9 @@ func tenantSlug(name, externalServiceID string) string {
 func (s *Store) CreateTenantOrganization(ctx context.Context, input CreateTenantOrganizationInput) (TenantOrganization, error) {
 	name := strings.TrimSpace(input.Name)
 	externalServiceID := strings.TrimSpace(input.ExternalServiceID)
-	if name == "" || externalServiceID == "" || input.Slots < 1 || input.Transcodes < 0 {
+	templateKey := strings.TrimSpace(input.EntitlementTemplateKey)
+	if name == "" || externalServiceID == "" || input.Slots < 1 || input.Transcodes < 0 ||
+		(templateKey == "") != (input.EntitlementTemplateRevision == 0) || input.EntitlementTemplateRevision < 0 {
 		return TenantOrganization{}, ErrTenantOrganizationInvalid
 	}
 	tx, err := s.pool.Begin(ctx)
@@ -153,7 +160,12 @@ func (s *Store) CreateTenantOrganization(ctx context.Context, input CreateTenant
 	if err != nil {
 		return TenantOrganization{}, fmt.Errorf("tenancy: create tenant organization: %w", err)
 	}
-	if err := ensureTenantDefaultAccessGroup(ctx, tx, organization.ID); err != nil {
+	if templateKey != "" {
+		if _, err := entitlements.ApplyTemplateInTx(ctx, tx, organization.ID, templateKey, input.EntitlementTemplateRevision, false); err != nil {
+			return TenantOrganization{}, fmt.Errorf("tenancy: apply tenant entitlement template: %w", err)
+		}
+		organization.AppliedEntitlementRevision = input.EntitlementTemplateRevision
+	} else if err := ensureTenantDefaultAccessGroup(ctx, tx, organization.ID); err != nil {
 		return TenantOrganization{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {

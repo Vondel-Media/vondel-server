@@ -95,6 +95,21 @@ func NewItemsHandler(content ContentService, userData UserDataService, codec *Re
 	return h
 }
 
+// itemFromDetailForSession applies the media-facing part of the resolved
+// policy after the shared mapper has built the Jellyfin DTO. CanDownload is a
+// direct-play transport capability in this protocol, but the same route also
+// downloads the original file. Consequently both playback and download policy
+// must allow it. Custom playback-on/download-off plans are incompatible with
+// Infuse direct play through this Jelly transport and advertise false.
+func (h *ItemsHandler) itemFromDetailForSession(ctx context.Context, session *Session, item upstreamItemDetail, isFavorite bool, progress *upstreamProgress, requestedFields map[string]bool) baseItemDTO {
+	dto := h.mapper.itemFromDetailWithFields(item, isFavorite, progress, requestedFields)
+	if dto.CanDownload && h.accessFilter != nil && session != nil {
+		filter := h.accessFilter(ctx, session.StreamAppUserID, session.ProfileID)
+		dto.CanDownload = !filter.PlaybackDenied && !filter.DownloadDenied
+	}
+	return dto
+}
+
 // HandleViews serves GET /Users/{userId}/Views.
 func (h *ItemsHandler) HandleViews(w http.ResponseWriter, r *http.Request) {
 	session := SessionFromContext(r.Context())
@@ -385,7 +400,7 @@ func (h *ItemsHandler) HandleItem(w http.ResponseWriter, r *http.Request) {
 		writeCompatUpstreamError(w, err)
 		return
 	}
-	dto := h.mapper.itemFromDetail(*detail, favorites[detail.ContentID], progress[detail.ContentID])
+	dto := h.itemFromDetailForSession(r.Context(), session, *detail, favorites[detail.ContentID], progress[detail.ContentID], nil)
 	h.appendDownloadedSubtitlesToDetailDTO(r.Context(), detail.ContentID, detail.Versions, &dto)
 	if strings.EqualFold(detail.Type, "series") {
 		if seasons, seasonErr := h.content.ListSeasons(r.Context(), session, detail.ContentID, nil); seasonErr == nil {
@@ -1148,7 +1163,7 @@ func (h *ItemsHandler) buildLatestItemDTOs(ctx context.Context, session *Session
 		if query.needsDetailFields {
 			if detail, ok := detailsByID[item.ContentID]; ok && detail != nil {
 				h.rememberDetailImages(*detail)
-				dto := h.mapper.itemFromDetailWithFields(*detail, favorites[detail.ContentID], progress[detail.ContentID], query.requestedFields)
+				dto := h.itemFromDetailForSession(ctx, session, *detail, favorites[detail.ContentID], progress[detail.ContentID], query.requestedFields)
 				if libraryParentID != "" {
 					dto.ParentID = libraryParentID
 				}
@@ -1548,7 +1563,7 @@ func (h *ItemsHandler) writeSeasonItemsResponse(w http.ResponseWriter, r *http.R
 			detail, detailErr := h.content.GetItemDetail(r.Context(), session, season.ContentID, nil)
 			if detailErr == nil {
 				h.rememberDetailImages(*detail)
-				dto := h.mapper.itemFromDetailWithFields(*detail, favorites[season.ContentID], nil, query.requestedFields)
+				dto := h.itemFromDetailForSession(r.Context(), session, *detail, favorites[season.ContentID], nil, query.requestedFields)
 				dto.ParentID = h.codec.EncodeStringID(EncodedIDItem, seriesID)
 				dto.SeriesID = h.codec.EncodeStringID(EncodedIDItem, seriesID)
 				dto.IndexNumber = &season.SeasonNumber
@@ -1709,7 +1724,7 @@ func (h *ItemsHandler) writeEpisodeModelsPage(w http.ResponseWriter, r *http.Req
 		if query.needsDetailFields {
 			if detail, ok := episodeDetails[episode.ContentID]; ok && detail != nil {
 				h.rememberDetailImages(*detail)
-				dto := h.mapper.itemFromDetailWithFields(*detail, favorites[episode.ContentID], progress[episode.ContentID], query.requestedFields)
+				dto := h.itemFromDetailForSession(r.Context(), session, *detail, favorites[episode.ContentID], progress[episode.ContentID], query.requestedFields)
 				dto.SeasonName = firstNonEmpty(seasonTitleByID[episode.SeasonID], seasonTitleByNumber[episode.SeasonNumber])
 				if dto.SeasonID == "" {
 					if seasonID := firstNonEmpty(episode.SeasonID, seasonIDByNumber[episode.SeasonNumber]); seasonID != "" {
@@ -1949,7 +1964,7 @@ func (h *ItemsHandler) writeNextUpResponse(w http.ResponseWriter, r *http.Reques
 				continue
 			}
 			h.rememberDetailImages(*detail)
-			dto := h.mapper.itemFromDetailWithFields(*detail, favorites[pageIDs[i]], progress[pageIDs[i]], query.requestedFields)
+			dto := h.itemFromDetailForSession(r.Context(), session, *detail, favorites[pageIDs[i]], progress[pageIDs[i]], query.requestedFields)
 			if target, ok := episodeTargets[pageIDs[i]]; ok {
 				h.applyCompatEpisodeTarget(&dto, target)
 			}
@@ -2182,7 +2197,7 @@ func (h *ItemsHandler) handleBrowseItems(w http.ResponseWriter, r *http.Request,
 		if query.needsDetailFields {
 			if detail, ok := detailsByID[item.ContentID]; ok && detail != nil {
 				h.rememberDetailImages(*detail)
-				dto := h.mapper.itemFromDetailWithFields(*detail, favorites[detail.ContentID], progress[detail.ContentID], query.requestedFields)
+				dto := h.itemFromDetailForSession(r.Context(), session, *detail, favorites[detail.ContentID], progress[detail.ContentID], query.requestedFields)
 				if libraryParentID != "" {
 					dto.ParentID = libraryParentID
 				}
@@ -2404,7 +2419,7 @@ func (h *ItemsHandler) handleSearchItems(w http.ResponseWriter, r *http.Request,
 		if query.needsDetailFields {
 			if detail, ok := detailsByID[item.ContentID]; ok && detail != nil {
 				h.rememberDetailImages(*detail)
-				dto := h.mapper.itemFromDetailWithFields(*detail, favorites[detail.ContentID], progress[detail.ContentID], query.requestedFields)
+				dto := h.itemFromDetailForSession(r.Context(), session, *detail, favorites[detail.ContentID], progress[detail.ContentID], query.requestedFields)
 				if libraryParentID != "" {
 					dto.ParentID = libraryParentID
 				}
@@ -2451,7 +2466,7 @@ func (h *ItemsHandler) handleSpecificItems(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		h.rememberDetailImages(*detail)
-		dto := h.mapper.itemFromDetailWithFields(*detail, favorites[detail.ContentID], progress[detail.ContentID], query.requestedFields)
+		dto := h.itemFromDetailForSession(r.Context(), session, *detail, favorites[detail.ContentID], progress[detail.ContentID], query.requestedFields)
 		h.appendDownloadedSubtitlesToDetailDTO(r.Context(), detail.ContentID, detail.Versions, &dto)
 		items = append(items, dto)
 	}
@@ -2917,7 +2932,7 @@ func (h *ItemsHandler) upgradeProgressPageToDetail(ctx context.Context, session 
 			continue
 		}
 		h.rememberDetailImages(*detail)
-		dto := h.mapper.itemFromDetailWithFields(*detail, page[i].isFavorite, &page[i].entry, query.requestedFields)
+		dto := h.itemFromDetailForSession(ctx, session, *detail, page[i].isFavorite, &page[i].entry, query.requestedFields)
 		if page[i].target != nil {
 			h.applyCompatEpisodeTarget(&dto, *page[i].target)
 		}

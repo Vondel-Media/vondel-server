@@ -37,6 +37,76 @@ func TestEffectivePolicyForSubjectResolvesExactSubject(t *testing.T) {
 	}
 }
 
+func TestEffectivePolicyForSubjectAdminBypassesGroupsWithPlaybackAllowed(t *testing.T) {
+	provider := &recordingGroupPolicyProvider{policy: &GroupPolicy{
+		PlaybackAllowed: false,
+	}}
+	user := &models.User{ID: 7, Role: models.RoleAdmin}
+
+	effective, err := EffectivePolicyForSubject(context.Background(), user, GroupSubject{AccountID: user.ID}, provider)
+	if err != nil {
+		t.Fatalf("EffectivePolicyForSubject() error: %v", err)
+	}
+	if !effective.PlaybackAllowed {
+		t.Fatal("PlaybackAllowed = false, want ungrouped admin playback allowed")
+	}
+	if provider.subject != (GroupSubject{}) {
+		t.Fatalf("ResolvePolicy called for admin subject %#v", provider.subject)
+	}
+}
+
+func TestApplyGroupPolicyRestrictsEntitlementPlaybackTranscodeAndProfiles(t *testing.T) {
+	user := &models.User{
+		TranscodeAllowed:      ptr(true),
+		AudioTranscodeAllowed: ptr(true),
+		MaxProfiles:           8,
+	}
+
+	effective := ApplyGroupPolicy(user, &GroupPolicy{
+		PlaybackAllowed:  false,
+		TranscodeAllowed: false,
+		MaxProfiles:      3,
+		RequestsAllowed:  true,
+	})
+
+	if effective.PlaybackAllowed {
+		t.Fatal("PlaybackAllowed = true, want browse-only group to deny playback")
+	}
+	if effective.TranscodeAllowed || effective.AudioTranscodeAllowed {
+		t.Fatalf("transcode flags = (%t, %t), want group restriction on video and audio", effective.TranscodeAllowed, effective.AudioTranscodeAllowed)
+	}
+	if effective.MaxProfiles != 3 {
+		t.Fatalf("MaxProfiles = %d, want strictest positive limit 3", effective.MaxProfiles)
+	}
+}
+
+func TestApplyGroupPolicyMaxProfilesUsesStrictestPositiveLayer(t *testing.T) {
+	tests := []struct {
+		name       string
+		accountCap int
+		groupCap   int
+		want       int
+	}{
+		{name: "account is stricter", accountCap: 2, groupCap: 5, want: 2},
+		{name: "group is stricter", accountCap: 5, groupCap: 2, want: 2},
+		{name: "unlimited group inherits account", accountCap: 5, groupCap: 0, want: 5},
+		{name: "unlimited account inherits group", accountCap: 0, groupCap: 4, want: 4},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			effective := ApplyGroupPolicy(&models.User{MaxProfiles: tt.accountCap}, &GroupPolicy{
+				PlaybackAllowed:  true,
+				TranscodeAllowed: true,
+				MaxProfiles:      tt.groupCap,
+				RequestsAllowed:  true,
+			})
+			if effective.MaxProfiles != tt.want {
+				t.Fatalf("MaxProfiles = %d, want %d", effective.MaxProfiles, tt.want)
+			}
+		})
+	}
+}
+
 type recordingGroupPolicyProvider struct {
 	subject GroupSubject
 	policy  *GroupPolicy
@@ -65,6 +135,7 @@ func TestApplyGroupPolicyNoGroupUsesOverridesOverPermissiveDefault(t *testing.T)
 	want := EffectiveUserPolicy{
 		LibraryIDs:               []int{1, 3},
 		MaxPlaybackQuality:       PlaybackQuality4K,
+		PlaybackAllowed:          true,
 		DownloadAllowed:          false,
 		DownloadTranscodeAllowed: true,
 		TranscodeAllowed:         true,
@@ -84,6 +155,7 @@ func TestApplyGroupPolicyUnsetUserInheritsNoGroupDefaults(t *testing.T) {
 	want := EffectiveUserPolicy{
 		LibraryIDs:         nil,
 		MaxPlaybackQuality: "",
+		PlaybackAllowed:    true,
 		DownloadAllowed:    true,
 		// The no-group default for transcoded downloads is deny: it matches
 		// the pre-inherit column default on users.
