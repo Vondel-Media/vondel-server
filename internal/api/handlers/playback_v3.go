@@ -124,6 +124,13 @@ type sessionReservationReleaserV3 interface {
 	ReleaseSession(string)
 }
 
+// proxyReservationReleaserV3 lets playback.proxy_policy discard a proxy the
+// planner picked alongside a transcode node, without releasing the
+// transcode-node hold too.
+type proxyReservationReleaserV3 interface {
+	ReleaseProxyReservation(string)
+}
+
 func (e *transportErrorV3) Error() string {
 	if e.cause != nil {
 		return e.reason + ": " + e.cause.Error()
@@ -286,7 +293,26 @@ type capabilitySessionPlannerV3 interface {
 // heterogeneous pool cannot land a recipe on a node that would reject it when
 // a capable sibling exists. Capability-blind selection remains for
 // transformation-free plans and non-enumerating planners.
+//
+// playback.proxy_policy is applied last, after selection: PlanSessionWith's
+// needsTranscode branch always tries to pick a proxy alongside the transcode
+// node (the two are chosen together so the proxy can be group-pinned to the
+// transcode node's LAN), so ProxyPolicyNever discards that pick here rather
+// than threading the policy into the planner's mechanics. Discarding without
+// releasing would leave the proxy's job/bandwidth reservation pinned for a
+// stream that will never use it, so the reservation is released too.
 func (h *PlaybackHandler) planNodeSessionV3(ctx context.Context, session *playback.Session, result playback.PlannerResultV3) nodepool.Plan {
+	plan := h.planNodeSessionCandidateV3(ctx, session, result)
+	if plan.ProxyNode != nil && !nodepool.ProxyStreamingPolicy(ctx, h.SettingsRepo).AllowsTranscodeProxy() {
+		if releaser, ok := h.NodePlanner.(proxyReservationReleaserV3); ok {
+			releaser.ReleaseProxyReservation(session.ID)
+		}
+		plan.ProxyNode = nil
+	}
+	return plan
+}
+
+func (h *PlaybackHandler) planNodeSessionCandidateV3(ctx context.Context, session *playback.Session, result playback.PlannerResultV3) nodepool.Plan {
 	selector, selectable := h.NodePlanner.(capabilitySessionPlannerV3)
 	enumerator, enumerable := h.NodePlanner.(transcodeNodeEnumeratorV3)
 	if !selectable || !enumerable || !planRequiresServerTransformationsV3(result.Plan) {
@@ -922,14 +948,18 @@ func (h *PlaybackHandler) prepareIdentityTransportV3(r *http.Request, session *p
 // bytes are either the source file or a single remux pipe — so the planner is
 // asked for a proxy alone, exactly as the Jellyfin-compat transport does.
 //
-// A nil node (no planner, no signing secret, or no eligible proxy) means the
-// API server serves the stream itself, which is both the single-node case and
-// the correct degradation when every proxy is unhealthy or at capacity. The one
-// exception is a remux that must run ffmpeg: that is transcode work, so it
-// honors the same local-fallback gate as the HLS routes rather than quietly
-// spawning an encoder on an API-only node.
+// A nil node (no planner, no signing secret, playback.proxy_policy forbids it,
+// or no eligible proxy) means the API server serves the stream itself, which
+// is both the single-node case and the correct degradation when every proxy
+// is unhealthy or at capacity. The one exception is a remux that must run
+// ffmpeg: that is transcode work, so it honors the same local-fallback gate
+// as the HLS routes rather than quietly spawning an encoder on an API-only
+// node.
 func (h *PlaybackHandler) planIdentityProxyV3(r *http.Request, sessionID string, result playback.PlannerResultV3) (*nodepool.Node, *transportErrorV3) {
 	if h.NodePlanner == nil || h.JWTSecret == "" {
+		return nil, h.refuseLocalIdentityWorkV3(r, result)
+	}
+	if !nodepool.ProxyStreamingPolicy(r.Context(), h.SettingsRepo).AllowsIdentityProxy() {
 		return nil, h.refuseLocalIdentityWorkV3(r, result)
 	}
 	// Reserve against the session id the rest of the transport uses, so a

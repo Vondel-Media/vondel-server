@@ -1,6 +1,7 @@
 package nodepool
 
 import (
+	"context"
 	"strconv"
 	"testing"
 	"time"
@@ -670,4 +671,86 @@ func TestProxyNodeURLsListsEnabledProxies(t *testing.T) {
 	if len(urls) != 2 {
 		t.Fatalf("proxy urls = %v, want both pooled proxies", urls)
 	}
+}
+
+type fakeProxyPolicySettings struct{ value string }
+
+func (f fakeProxyPolicySettings) Get(context.Context, string) (string, error) {
+	return f.value, nil
+}
+
+func TestProxyStreamingPolicy(t *testing.T) {
+	cases := []struct {
+		name  string
+		value string
+		want  ProxyPolicy
+	}{
+		{name: "nil settings default to always", value: "", want: ProxyPolicyAlways},
+		{name: "unset key defaults to always", value: "", want: ProxyPolicyAlways},
+		{name: "always", value: "always", want: ProxyPolicyAlways},
+		{name: "transcode_only", value: "transcode_only", want: ProxyPolicyTranscodeOnly},
+		{name: "never", value: "never", want: ProxyPolicyNever},
+		{name: "unrecognized value falls back to always", value: "bogus", want: ProxyPolicyAlways},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ProxyStreamingPolicy(context.Background(), fakeProxyPolicySettings{value: tc.value})
+			if got != tc.want {
+				t.Fatalf("ProxyStreamingPolicy(%q) = %q, want %q", tc.value, got, tc.want)
+			}
+		})
+	}
+	if got := ProxyStreamingPolicy(context.Background(), nil); got != ProxyPolicyAlways {
+		t.Fatalf("ProxyStreamingPolicy(nil settings) = %q, want %q", got, ProxyPolicyAlways)
+	}
+}
+
+func TestProxyPolicyAllowsHelpers(t *testing.T) {
+	if !ProxyPolicyAlways.AllowsIdentityProxy() || !ProxyPolicyAlways.AllowsTranscodeProxy() {
+		t.Fatal("always must allow both identity and transcode proxy routing")
+	}
+	if ProxyPolicyTranscodeOnly.AllowsIdentityProxy() || !ProxyPolicyTranscodeOnly.AllowsTranscodeProxy() {
+		t.Fatal("transcode_only must forbid identity proxy but allow transcode proxy")
+	}
+	if ProxyPolicyNever.AllowsIdentityProxy() || ProxyPolicyNever.AllowsTranscodeProxy() {
+		t.Fatal("never must forbid both identity and transcode proxy routing")
+	}
+}
+
+// ReleaseProxyReservation must drop only the proxy half of a session's
+// reservation, leaving the transcode-node hold (and thus its job-count
+// accounting) intact, and must not panic on an unknown session id.
+func TestReleaseProxyReservation(t *testing.T) {
+	proxies := NewProxyPool()
+	proxies.SetNodes([]*Node{{ID: 1, URL: "http://proxy-1", Enabled: true, Healthy: true}})
+	transcodes := NewTranscodePool()
+	transcodes.SetNodes([]*Node{{ID: 2, URL: "http://transcode-1", Enabled: true, Healthy: true}})
+	planner := NewPlanner(proxies, transcodes)
+
+	plan := planner.PlanSessionWith("session-release", "", true, 1000, nil)
+	if plan.ProxyNode == nil || plan.TranscodeNode == nil {
+		t.Fatalf("plan = %+v, want both a proxy and a transcode node reserved", plan)
+	}
+
+	planner.ReleaseProxyReservation("session-release")
+
+	res, ok := planner.reserved["session-release"]
+	if !ok {
+		t.Fatal("releasing the proxy half dropped the whole reservation")
+	}
+	if res.proxyURL != "" || res.kbps != 0 {
+		t.Fatalf("reservation still carries proxy state: %+v", res)
+	}
+	if res.transcodeURL != plan.TranscodeNode.URL {
+		t.Fatalf("transcode reservation = %q, want %q preserved", res.transcodeURL, plan.TranscodeNode.URL)
+	}
+
+	// The released proxy must be immediately claimable by another session.
+	again := planner.PlanSession("session-should-claim-proxy", "", false, 0)
+	if again.ProxyNode == nil || again.ProxyNode.URL != "http://proxy-1" {
+		t.Fatalf("proxy remained reserved after release: %+v", again)
+	}
+
+	// Unknown session id must not panic.
+	planner.ReleaseProxyReservation("no-such-session")
 }
